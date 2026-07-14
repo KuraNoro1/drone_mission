@@ -1,0 +1,6 @@
+connection:
+  #真实飞行
+  #url: "serial:///dev/ttyTHS1:57600"
+  #仿真启动
+  url: "udp://:14550" 
+  heartbeatTimeout: 10.0

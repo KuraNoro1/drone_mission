@@ -1,0 +1,6 @@
+servo:
+  leftChannel: 11
+  rightChannel: 12
+  releasePwm: 1900
+  holdPwm: 1100
+  releaseDurationMs: 800

@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.pyc
+*.o
+*.so
+*.pt
+*.png
+*.csv
+droneMission

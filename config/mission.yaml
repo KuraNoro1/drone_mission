@@ -1,0 +1,65 @@
+connection:
+  #url: "serial:///dev/ttyTHS1:57600"
+  url: "udp://:14550"
+  heartbeatTimeout: 10.0
+
+flight:
+  takeoffAlt: 5.0
+  cruiseAlt: 5.0
+  dropAlt: 1.5
+
+dropZone:
+  centerNorth: 30.0
+  centerEast: 0.0
+  barrelCount: 3
+  noDetectTimeout: 8.0
+  scanOffset: 2.5
+
+reconZone:
+  centerNorth: 60.0
+  centerEast: 0.0
+  hoverTime: 3.0
+  waypoints:
+    - { north: 53.0, east: -3.0 }
+    - { north: 54.0, east:  3.0 }
+    - { north: 55.0, east: -3.0 }
+    - { north: 56.0, east:  3.0 }
+    - { north: 57.0, east: -3.0 }
+
+pid:
+  kp: 0.8
+  ki: 0.02
+  kd: 0.0
+  maxVelXY: 1.0
+  kpZ: 0.3
+  kdZ: 0.05
+  maxVelZ: 0.5
+  centerTolPx: 40
+  holdTime: 0.5
+
+vision:
+  pipePath: "/tmp/vision_pipe"
+  cmdPipePath: "/tmp/mission_cmd"
+  imageWidth: 640
+  imageHeight: 640
+  targetClass: 0
+
+servo:
+  leftChannel: 11
+  rightChannel: 12
+  releasePwm: 1900
+  holdPwm: 1100
+  releaseDurationMs: 800
+
+landing:
+  rtlTimeout: 120
+
+pidTest:
+  testAlt: 1.2
+  leftOffsetM: 3.0
+  rightOffsetM: 3.0
+  hoverBeforeSec: 3.0
+  hoverAfterSec: 30.0
+  convergeTolM: 0.3
+  convergeHoldSec: 1.5
+  timeoutSec: 30

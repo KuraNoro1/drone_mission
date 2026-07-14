@@ -1,0 +1,22 @@
+pidXY:
+  kp: 0.8
+  ki: 0.02
+  kd: 0.2
+  maxVel: 1.0
+
+pidZ:
+  kp: 0.5
+  ki: 0.01
+  kd: 0.1
+  maxVel: 0.5
+
+pidVisual:
+  kp: 0.8
+  ki: 0.0
+  kd: 0.15
+  maxVelXY: 1.0
+  kpZ: 0.3
+  kdZ: 0.05
+  maxVelZ: 0.5
+  centerTolPx: 40
+  holdTime: 0.5

@@ -1,0 +1,6 @@
+vision:
+  pipePath: "/tmp/vision_pipe"
+  cmdPipePath: "/tmp/mission_cmd"
+  imageWidth: 640
+  imageHeight: 640
+  targetClass: 0

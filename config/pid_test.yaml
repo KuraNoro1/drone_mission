@@ -1,0 +1,12 @@
+pidTest:
+  testAlt: 1.2
+  leftOffsetM: 3.0
+  rightOffsetM: 3.0
+  hoverBeforeSec: 3.0
+  hoverAfterSec: 30.0
+  convergeTolM: 0.3
+  convergeHoldSec: 1.5
+  timeoutSec: 30
+
+landing:
+  rtlTimeout: 120
