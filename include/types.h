@@ -28,6 +28,18 @@ struct detection {
     double confidence;
 };
 
+struct bucketDetection {
+    int bucketId;   // 1=15cm, 2=20cm, 3=25cm
+    double cx;
+    double cy;
+};
+
+struct multiBucketData {
+    int count;
+    std::vector<bucketDetection> buckets;
+    bool empty() const { return count == 0 || buckets.empty(); }
+};
+
 struct servoConfig {
     int leftChannel;
     int rightChannel;
@@ -130,6 +142,7 @@ struct missionConfigData {
     landingConfig landing;
     pidTestConfig pidTest;
     projectPaths paths;
+    int missionPriority;   // 0=优先大桶(桶3), 1=优先小桶(桶1)
 };
 
 enum class missionState {

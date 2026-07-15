@@ -9,6 +9,7 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <algorithm>
 
 using namespace std::chrono;
 
@@ -19,111 +20,136 @@ namespace {
     }
     void log(const std::string& msg) {
         std::cout << "[" << std::fixed << std::setprecision(1)
-                  << elapsedSec() << "s] " << msg << std::endl;
+                  << elapsedSec() << "s] [PIPE] " << msg << std::endl;
     }
 }
 
-// ─── binaryVisionPipe ─────────────────────────────────────
+// ─── multiBucketPipe: variable-length binary protocol ───────────────────
+// Protocol: [count:1B] [id:1B cx:4B cy:4B] * count
+// Total = 1 + count * 9 bytes
 
-binaryVisionPipe::binaryVisionPipe(const std::string& path) : path_(path), fd_(-1) {}
+multiBucketPipe::multiBucketPipe(const std::string& path) : path_(path), fd_(-1) {}
 
-binaryVisionPipe::~binaryVisionPipe() { close(); }
+multiBucketPipe::~multiBucketPipe() { close(); }
 
-bool binaryVisionPipe::open() {
+bool multiBucketPipe::open() {
     if (fd_ >= 0) return true;
     if (::access(path_.c_str(), F_OK) == -1) {
         ::mkfifo(path_.c_str(), 0666);
     }
-    log("Opening binary pipe (blocking, waiting for Python)...");
-    fd_ = ::open(path_.c_str(), O_RDONLY);
+    log("Opening multi-bucket pipe (non-blocking)...");
+    fd_ = ::open(path_.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd_ < 0) {
-        log("WARNING: Cannot open binary pipe: " + path_);
+        log("WARNING: Cannot open pipe: " + path_ + " (" + strerror(errno) + ")");
         return false;
     }
-    log("Binary vision pipe opened: " + path_);
+    log("Multi-bucket pipe opened: " + path_);
+    buffer_.clear();
     return true;
 }
 
-void binaryVisionPipe::close() {
+void multiBucketPipe::close() {
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    buffer_.clear();
 }
 
-bool binaryVisionPipe::readLatest(visionBinaryData& data) {
+bool multiBucketPipe::readLatest(multiBucketData& data) {
     if (fd_ < 0) return false;
 
-    // 切换到非阻塞模式进行排空读取
     int flags = fcntl(fd_, F_GETFL, 0);
     fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
 
-    bool got = false;
-    int count = 0;
-    visionBinaryData temp;
+    uint8_t tmp[512];
+    int bytesRead = 0;
     while (true) {
-        ssize_t n = read(fd_, &temp, sizeof(temp));
-        if (n == sizeof(temp)) {
-            data = temp;
-            got = true;
-            count++;
-        } else {
-            break;
-        }
+        ssize_t n = read(fd_, tmp, sizeof(tmp));
+        if (n <= 0) break;
+        buffer_.insert(buffer_.end(), tmp, tmp + n);
+        bytesRead += n;
     }
 
-    // 恢复原始标志 (阻塞模式)
     fcntl(fd_, F_SETFL, flags);
 
-    if (got) {
+    bool got = false;
+    size_t consumedUntil = 0;
+
+    size_t offset = 0;
+    while (offset < buffer_.size()) {
+        if (offset + 1 > buffer_.size()) break;
+        uint8_t count = buffer_[offset];
+        size_t msgSize = 1 + static_cast<size_t>(count) * 9;
+        if (offset + msgSize > buffer_.size()) break;
+
+        size_t pos = offset + 1;
+        multiBucketData parsed;
+        parsed.count = count;
+        for (int i = 0; i < count; i++) {
+            uint8_t id = buffer_[pos]; pos += 1;
+            float cx, cy;
+            std::memcpy(&cx, &buffer_[pos], 4); pos += 4;
+            std::memcpy(&cy, &buffer_[pos], 4); pos += 4;
+            parsed.buckets.push_back({(int)id, (double)cx, (double)cy});
+        }
+
+        offset += msgSize;
+        consumedUntil = offset;
+        data = parsed;
+        got = true;
+    }
+
+    if (consumedUntil > 0) {
+        buffer_.erase(buffer_.begin(), buffer_.begin() + consumedUntil);
+    }
+
+    if (got && bytesRead > 0) {
         static int logCounter = 0;
-        if (++logCounter % 20 == 1) {
-            std::cout << "  [pipe] got " << count << " msgs, latest: cx="
-                      << data.cx << " cy=" << data.cy
-                      << " conf=" << data.confidence << std::endl;
+        if (++logCounter % 10 == 1) {
+            std::ostringstream oss;
+            oss << "got multi-bucket: count=" << data.count;
+            for (const auto& b : data.buckets) {
+                oss << " [桶" << b.bucketId << " cx=" << std::fixed << std::setprecision(0)
+                    << b.cx << " cy=" << b.cy << "]";
+            }
+            log("  " + oss.str());
         }
     }
     return got;
 }
 
-bool binaryVisionPipe::isOpen() const { return fd_ >= 0; }
+bool multiBucketPipe::isOpen() const { return fd_ >= 0; }
 
-// ─── visionPipe ───────────────────────────────────────────
+// ─── hDetectionPipe: text protocol for H landing pad ───────────────────
+// Receives: "None\n" or "cx,cy\n"
 
-visionPipe::visionPipe(const std::string& path, int imgW, int imgH)
-    : path_(path), imgW_(imgW), imgH_(imgH), fd_(-1), running_(false), hasNewData_(false) {}
+hDetectionPipe::hDetectionPipe(const std::string& path)
+    : path_(path), fd_(-1), running_(false), latestCx_(0), latestCy_(0),
+      hasNewData_(false), hasDetection_(false) {}
 
-visionPipe::~visionPipe() { close(); }
+hDetectionPipe::~hDetectionPipe() { close(); }
 
-bool visionPipe::open(bool createPipe) {
-    if (createPipe) {
-        unlink(path_.c_str());
-        if (mkfifo(path_.c_str(), 0666) != 0) {
-            log("WARNING: mkfifo failed: " + std::string(strerror(errno)));
-        }
+bool hDetectionPipe::open() {
+    unlink(path_.c_str());
+    if (mkfifo(path_.c_str(), 0666) != 0) {
+        log("WARNING: h_pipe mkfifo: " + std::string(strerror(errno)));
     }
-
     fd_ = ::open(path_.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd_ < 0) {
-        log("ERROR: Cannot open vision pipe: " + path_ + " (" + strerror(errno) + ")");
+        log("ERROR: Cannot open H pipe: " + path_);
         return false;
     }
-
     running_ = true;
-    readerThread_ = std::thread(&visionPipe::readLoop, this);
-    log("Vision pipe opened: " + path_);
+    readerThread_ = std::thread(&hDetectionPipe::readLoop, this);
+    log("H pipe opened: " + path_);
     return true;
 }
 
-void visionPipe::close() {
+void hDetectionPipe::close() {
     running_ = false;
-    if (readerThread_.joinable()) {
-        readerThread_.join();
-    }
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    if (readerThread_.joinable()) readerThread_.join();
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 }
 
-void visionPipe::readLoop() {
+void hDetectionPipe::readLoop() {
     char buf[256];
     std::string line;
     fd_set fds;
@@ -140,7 +166,6 @@ void visionPipe::readLoop() {
             if (errno == EAGAIN) continue;
             break;
         }
-
         buf[n] = '\0';
         line += buf;
 
@@ -149,40 +174,36 @@ void visionPipe::readLoop() {
             std::string msg = line.substr(0, pos);
             line.erase(0, pos + 1);
 
-            detection det{};
-            std::istringstream iss(msg);
-            if (iss >> det.classId >> det.cx >> det.cy >> det.width >> det.height >> det.confidence) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                latestDetection_ = det;
-                hasNewData_ = true;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (msg == "None" || msg.empty()) {
+                hasDetection_ = false;
+            } else {
+                std::istringstream iss(msg);
+                char comma;
+                if (iss >> latestCx_ >> comma >> latestCy_) {
+                    hasDetection_ = true;
+                } else {
+                    hasDetection_ = false;
+                }
             }
+            hasNewData_ = true;
         }
     }
 }
 
-bool visionPipe::readLatest(detection& det) {
+bool hDetectionPipe::readLatest(double& cx, double& cy) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!hasNewData_) return false;
-    det = latestDetection_;
     hasNewData_ = false;
+    if (!hasDetection_) return false;
+    cx = latestCx_;
+    cy = latestCy_;
     return true;
 }
 
-std::vector<detection> visionPipe::readAll() {
-    std::vector<detection> result;
-    detection det;
-    while (readLatest(det)) {
-        result.push_back(det);
-    }
-    return result;
-}
+bool hDetectionPipe::isOpen() const { return running_.load(); }
 
-bool visionPipe::isOpen() const { return running_.load(); }
-
-int visionPipe::imageWidth() const { return imgW_; }
-int visionPipe::imageHeight() const { return imgH_; }
-double visionPipe::imageCx() const { return imgW_ / 2.0; }
-double visionPipe::imageCy() const { return imgH_ / 2.0; }
+// ─── missionCmdPipe ────────────────────────────────────────────────────
 
 missionCmdPipe::missionCmdPipe(const std::string& path) : path_(path), fd_(-1) {}
 

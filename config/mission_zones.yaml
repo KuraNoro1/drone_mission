@@ -4,6 +4,7 @@ dropZone:
   barrelCount: 3
   noDetectTimeout: 8.0
   scanOffset: 2.5
+  priority: 0   # 0=优先大桶(桶3=25cm), 1=优先小桶(桶1=15cm)
 
 reconZone:
   centerNorth: 60.0

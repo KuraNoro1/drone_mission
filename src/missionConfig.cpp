@@ -96,6 +96,7 @@ void missionConfig::parseDropZone(const YAML::Node& node) {
     data_.dropZone.barrelCount = node["barrelCount"].as<int>();
     data_.dropZone.noDetectTimeout = node["noDetectTimeout"].as<double>();
     data_.dropZone.scanOffset = node["scanOffset"].as<double>();
+    data_.missionPriority = node["priority"] ? node["priority"].as<int>() : 0;
 }
 
 void missionConfig::parseReconZone(const YAML::Node& node) {

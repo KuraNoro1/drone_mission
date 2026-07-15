@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-仿真视觉检测 (detector_sim)
+仿真视觉检测 (detector_sim) - 多桶检测版
 - 自动启动 gz_gst_bridge (Gazebo 相机 → TCP :5000), 退出时自动关闭
-- 从 TCP 流拉取图像进行 YOLO 检测
-- 多线程: 采集 → 推理 → 管道发送 → OpenCV 显示窗口
-- 发送格式: struct.pack('fff', cx, cy, conf) — 12 字节
+- 检测所有桶，根据直径映射为桶1(15cm)、桶2(20cm)、桶3(25cm)
+- 管道发送：数量(1字节) + 每个桶 (ID 1字节 + cx float + cy float)
 """
 
 import cv2
@@ -18,6 +17,7 @@ import threading
 import signal
 import subprocess
 import numpy as np
+import fcntl
 
 # ================== 配置 ==================
 MODEL_PATH = os.path.expanduser("~/yolo_test/best.pt")
@@ -31,7 +31,9 @@ STREAM_URL = "tcp://127.0.0.1:5000"
 USE_DISPLAY = True
 DISPLAY_FPS = 15
 
-# gz_gst_bridge 脚本路径 (用系统 python3, 不依赖 conda)
+THRESH_15_20 = 30
+THRESH_20_25 = 55
+
 GST_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gz_gst_bridge.py")
 # ==========================================
 
@@ -43,17 +45,15 @@ running = True
 pipe_w = None
 bridge_proc = None
 
-# ── CUDA ──
 if not torch.cuda.is_available():
-    print("⚠️ CUDA 不可用, 使用 CPU")
+    print("CUDA 不可用, 使用 CPU")
 else:
-    print(f"✅ CUDA 可用, 设备: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA 可用, 设备: {torch.cuda.get_device_name(0)}")
 
-# ── 加载模型 ──
 if not os.path.exists(YOLOV5_REPO):
-    print(f"❌ YOLOv5 仓库不存在: {YOLOV5_REPO}"); sys.exit(1)
+    print(f"YOLOv5 仓库不存在: {YOLOV5_REPO}"); sys.exit(1)
 if not os.path.exists(MODEL_PATH):
-    print(f"❌ 模型文件不存在: {MODEL_PATH}"); sys.exit(1)
+    print(f"模型文件不存在: {MODEL_PATH}"); sys.exit(1)
 
 print("正在加载模型...")
 try:
@@ -62,27 +62,35 @@ try:
                            device='0', force_reload=True)
     model.conf = CONF_THRESH
     model.classes = [TARGET_CLASS]
-    print("✅ 模型加载成功")
+    print("模型加载成功")
 except Exception as e:
-    print(f"❌ 模型加载失败: {e}"); sys.exit(1)
+    print(f"模型加载失败: {e}"); sys.exit(1)
 
-# ── 管道 ──
 if not os.path.exists(PIPE_PATH):
     os.mkfifo(PIPE_PATH)
-    print(f"📁 创建管道 {PIPE_PATH}")
+    print(f"创建管道 {PIPE_PATH}")
 
 print("等待 C++ 程序连接管道...")
 pipe_w = open(PIPE_PATH, 'wb')
+fd = pipe_w.fileno()
+flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 print("C++ 已连接")
 
-# ── 启动相机桥接 ──
+def classify_bucket_id(pixel_width):
+    if pixel_width < THRESH_15_20:
+        return 1
+    elif pixel_width < THRESH_20_25:
+        return 2
+    else:
+        return 3
+
 def start_camera_bridge():
     global bridge_proc
     cmd = ["/usr/bin/python3", GST_BRIDGE, "--tcp", "5000", "--no-display"]
     print(f"[bridge] 启动: {' '.join(cmd)}")
     bridge_proc = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
     print(f"[bridge] PID={bridge_proc.pid}")
-    # 等待 TCP 服务器就绪
     time.sleep(3)
 
 def stop_camera_bridge():
@@ -96,16 +104,15 @@ def stop_camera_bridge():
             bridge_proc.kill()
         print("[bridge] 已关闭")
 
-# ── 采集线程 ──
 def capture_worker():
     global running
     cap = cv2.VideoCapture(STREAM_URL)
     if not cap.isOpened():
-        print(f"❌ 无法连接 {STREAM_URL}")
+        print(f"无法连接 {STREAM_URL}")
         running = False
         return
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    print("✅ 采集线程已启动")
+    print("采集线程已启动")
     while running:
         ret, frame = cap.read()
         if not ret:
@@ -118,7 +125,6 @@ def capture_worker():
     cap.release()
     print("采集线程退出")
 
-# ── 推理线程 ──
 def inference_worker():
     global running
     print("推理线程已启动")
@@ -130,31 +136,38 @@ def inference_worker():
         results = model(frame, size=IMG_SIZE)
         detections = results.xyxy[0].cpu().numpy()
 
-        cx = cy = conf = 0.0
-        x1 = y1 = x2 = y2 = 0
         if len(detections) > 0:
             target_dets = detections[detections[:, 5] == TARGET_CLASS]
-            if len(target_dets) > 0:
-                best = target_dets[target_dets[:, 4].argmax()]
-                x1, y1, x2, y2, conf, cls = best
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                # 每 30 帧打印一次识别结果
-                if int(time.time() * 2) % 60 == 0:
-                    print(f"  [YOLO] circle: ({cx:.0f},{cy:.0f}) conf={conf:.2f}  → pipe",
-                          flush=True)
+        else:
+            target_dets = []
 
+        bucket_list = []
         result_frame = frame.copy()
-        if cx != 0 or cy != 0:
+
+        for box in target_dets:
+            x1, y1, x2, y2, conf, cls = box
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            pixel_width = x2 - x1
+            bucket_id = classify_bucket_id(pixel_width)
+            bucket_list.append((bucket_id, cx, cy))
+
             cv2.rectangle(result_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
             cv2.circle(result_frame, (int(cx), int(cy)), 5, (0,0,255), -1)
-            cv2.putText(result_frame, f"({cx:.1f},{cy:.1f}) {conf:.2f}",
-                        (int(cx)+10, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1)
+            cv2.putText(result_frame, f"bucket{bucket_id}", (int(x1), int(y1)-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        if len(bucket_list) == 0:
+            if int(time.time() * 2) % 60 == 0:
+                print("None", flush=True)
+        else:
+            for bid, cx, cy in bucket_list:
+                print(f"bucket{bid}: ({cx:.1f}, {cy:.1f})")
 
         while not pipe_queue.empty():
             try: pipe_queue.get_nowait()
             except queue.Empty: break
-        pipe_queue.put((cx, cy, conf))
+        pipe_queue.put((len(bucket_list), bucket_list))
 
         if USE_DISPLAY:
             while not disp_queue.empty():
@@ -163,7 +176,6 @@ def inference_worker():
             disp_queue.put(result_frame)
     print("推理线程退出")
 
-# ── 管道发送线程 ──
 def pipe_sender_worker():
     global running, pipe_w
     print("管道发送线程已启动")
@@ -171,18 +183,21 @@ def pipe_sender_worker():
         if pipe_queue.empty():
             time.sleep(0.002)
             continue
-        cx, cy, conf = pipe_queue.get()
+        count, bucket_list = pipe_queue.get()
         try:
-            data = struct.pack('fff', cx, cy, conf)
-            pipe_w.write(data)
+            pipe_w.write(struct.pack('B', count))
+            for bucket_id, cx, cy in bucket_list:
+                pipe_w.write(struct.pack('B', bucket_id))
+                pipe_w.write(struct.pack('ff', cx, cy))
             pipe_w.flush()
+        except (BlockingIOError, BrokenPipeError, OSError):
+            pass
         except Exception as e:
             print(f"管道发送错误: {e}")
             running = False
             break
     print("管道发送线程退出")
 
-# ── 显示线程 ──
 def display_worker():
     global running
     if not USE_DISPLAY:
@@ -203,7 +218,6 @@ def display_worker():
     cv2.destroyAllWindows()
     print("显示线程退出")
 
-# ── 主程序 ──
 def cleanup(sig=None, frame=None):
     global running
     running = False
@@ -218,13 +232,10 @@ def main():
     threads = []
     t_cap = threading.Thread(target=capture_worker, daemon=True)
     t_cap.start(); threads.append(t_cap)
-
     t_infer = threading.Thread(target=inference_worker, daemon=True)
     t_infer.start(); threads.append(t_infer)
-
     t_pipe = threading.Thread(target=pipe_sender_worker, daemon=True)
     t_pipe.start(); threads.append(t_pipe)
-
     if USE_DISPLAY:
         t_disp = threading.Thread(target=display_worker, daemon=True)
         t_disp.start(); threads.append(t_disp)

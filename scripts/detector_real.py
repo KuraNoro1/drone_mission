@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Jetson Nano 视觉检测 — 真机版 (detector_real)
-- 从 TCP 视频流拉取图像 (CSI→GStreamer→tcpserversink)
-- 多线程：采集 / 推理 / 管道发送 / 显示
-- 检测 class=0 (circle), 通过 /tmp/vision_pipe 发送圆心坐标
-- 发送格式: struct.pack('fff', cx, cy, conf) — 12 字节二进制
+Jetson Nano 视觉检测 - 投放区专用（输出桶ID+坐标）
+- 检测所有桶，根据直径映射为桶1(15cm)、桶2(20cm)、桶3(25cm)
+- 管道发送：数量(1字节) + 每个桶 (ID 1字节 + cx float + cy float)
+- 无桶时发送数量0
 """
 
 import cv2
@@ -16,43 +15,45 @@ import time
 import queue
 import threading
 import numpy as np
+import fcntl
 
-# ================== 配置 ==================
-MODEL_PATH = "/home/hy/yolo_test/best.pt"
-YOLOV5_REPO = "/home/hy/yolov5"
+# ================== 用户配置 ==================
+MODEL_PATH = os.path.expanduser("~/yolo_test/best.pt")
+YOLOV5_REPO = os.path.expanduser("~/yolov5")
 PIPE_PATH = "/tmp/vision_pipe"
 IMG_SIZE = 416
 CONF_THRESH = 0.6
 TARGET_CLASS = 0
 
 STREAM_URL = "tcp://127.0.0.1:5000"
+
 USE_DISPLAY = True
 DISPLAY_FPS = 15
-# ==========================================
 
-# ---------- 全局队列 ----------
-# 容量为 1，保证永远只保留最新帧
-raw_queue = queue.Queue(maxsize=1)        # 采集 -> 推理
-disp_queue = queue.Queue(maxsize=1)       # 推理 -> 显示
-pipe_queue = queue.Queue(maxsize=1)       # 推理 -> 管道发送（可选，避免阻塞）
+# 直径分类像素阈值（需根据实际飞行高度标定）
+THRESH_15_20 = 30
+THRESH_20_25 = 55
+# ==============================================
 
-# 全局标志
+raw_queue = queue.Queue(maxsize=1)
+disp_queue = queue.Queue(maxsize=1)
+pipe_queue = queue.Queue(maxsize=1)
+
 running = True
 pipe_w = None
 
 # ---------- 检查 CUDA ----------
 if not torch.cuda.is_available():
-    print("⚠️ CUDA 不可用，使用 CPU")
-    device = 'cpu'
+    print("CUDA 不可用，使用 CPU")
 else:
-    print(f"✅ CUDA 可用，设备: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA 可用，设备: {torch.cuda.get_device_name(0)}")
 
 # ---------- 加载模型 ----------
 if not os.path.exists(YOLOV5_REPO):
-    print(f"❌ YOLOv5 仓库不存在: {YOLOV5_REPO}")
+    print(f"YOLOv5 仓库不存在: {YOLOV5_REPO}")
     sys.exit(1)
 if not os.path.exists(MODEL_PATH):
-    print(f"❌ 模型文件不存在: {MODEL_PATH}")
+    print(f"模型文件不存在: {MODEL_PATH}")
     sys.exit(1)
 
 print("正在加载模型...")
@@ -62,41 +63,48 @@ try:
                            device='0', force_reload=True)
     model.conf = CONF_THRESH
     model.classes = [TARGET_CLASS]
-    print("✅ 模型加载成功")
+    print("模型加载成功")
 except Exception as e:
-    print(f"❌ 模型加载失败: {e}")
+    print(f"模型加载失败: {e}")
     sys.exit(1)
 
-# ---------- 创建命名管道（与 C++ 通信） ----------
+# ---------- 创建命名管道（非阻塞） ----------
 if not os.path.exists(PIPE_PATH):
     os.mkfifo(PIPE_PATH)
-    print(f"📁 创建管道 {PIPE_PATH}")
+    print(f"创建管道 {PIPE_PATH}")
 
 print("等待 C++ 程序连接管道...")
 pipe_w = open(PIPE_PATH, 'wb')
+fd = pipe_w.fileno()
+flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 print("C++ 已连接")
+
+# ---------- 直径分类与桶ID映射 ----------
+def classify_bucket_id(pixel_width):
+    if pixel_width < THRESH_15_20:
+        return 1
+    elif pixel_width < THRESH_20_25:
+        return 2
+    else:
+        return 3
 
 # ---------- 采集线程 ----------
 def capture_worker():
-    """从 TCP 流拉取最新帧，放入 raw_queue"""
     global running
     cap = cv2.VideoCapture(STREAM_URL)
     if not cap.isOpened():
-        print("❌ 无法连接 TCP 视频流")
+        print("无法连接 TCP 视频流")
         running = False
         return
-
-    # 关键：减少内部缓冲
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    print("✅ 采集线程已启动")
+    print("采集线程已启动")
 
     while running:
         ret, frame = cap.read()
         if not ret:
             time.sleep(0.005)
             continue
-
-        # 只保留最新帧（丢弃旧帧）
         while not raw_queue.empty():
             try:
                 raw_queue.get_nowait()
@@ -109,49 +117,53 @@ def capture_worker():
 
 # ---------- 推理线程 ----------
 def inference_worker():
-    """从 raw_queue 取最新帧，执行推理，结果放入 disp_queue 和 pipe_queue"""
     global running
     print("推理线程已启动")
 
     while running:
-        # 没有新帧时等待
         if raw_queue.empty():
             time.sleep(0.001)
             continue
 
         frame = raw_queue.get()
 
-        # ---------- 推理 ----------
         results = model(frame, size=IMG_SIZE)
         detections = results.xyxy[0].cpu().numpy()
 
-        cx = cy = conf = 0.0
         if len(detections) > 0:
             target_dets = detections[detections[:, 5] == TARGET_CLASS]
-            if len(target_dets) > 0:
-                best = target_dets[target_dets[:, 4].argmax()]
-                x1, y1, x2, y2, conf, cls = best
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
+        else:
+            target_dets = []
 
-        # ---------- 绘制结果（在拷贝上操作，不影响原始帧） ----------
+        bucket_list = []
         result_frame = frame.copy()
-        if cx != 0 or cy != 0:
+
+        for box in target_dets:
+            x1, y1, x2, y2, conf, cls = box
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            pixel_width = x2 - x1
+            bucket_id = classify_bucket_id(pixel_width)
+            bucket_list.append((bucket_id, cx, cy))
+
             cv2.rectangle(result_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
             cv2.circle(result_frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
-            cv2.putText(result_frame, f"({cx:.1f},{cy:.1f}) {conf:.2f}",
-                        (int(cx)+10, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1)
+            cv2.putText(result_frame, f"bucket{bucket_id}", (int(x1), int(y1)-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-        # ---------- 发送坐标到管道（非阻塞方式） ----------
-        # 使用队列避免管道阻塞影响推理循环
+        if len(bucket_list) == 0:
+            print("None")
+        else:
+            for bid, cx, cy in bucket_list:
+                print(f"bucket{bid}: ({cx:.1f}, {cy:.1f})")
+
         while not pipe_queue.empty():
             try:
                 pipe_queue.get_nowait()
             except queue.Empty:
                 break
-        pipe_queue.put((cx, cy, conf))
+        pipe_queue.put((len(bucket_list), bucket_list))
 
-        # ---------- 结果送入显示队列 ----------
         if USE_DISPLAY:
             while not disp_queue.empty():
                 try:
@@ -164,7 +176,6 @@ def inference_worker():
 
 # ---------- 管道发送线程 ----------
 def pipe_sender_worker():
-    """独立线程发送坐标到管道，避免阻塞推理"""
     global running, pipe_w
     print("管道发送线程已启动")
 
@@ -173,11 +184,15 @@ def pipe_sender_worker():
             time.sleep(0.002)
             continue
 
-        cx, cy, conf = pipe_queue.get()
+        count, bucket_list = pipe_queue.get()
         try:
-            data = struct.pack('fff', cx, cy, conf)
-            pipe_w.write(data)
+            pipe_w.write(struct.pack('B', count))
+            for bucket_id, cx, cy in bucket_list:
+                pipe_w.write(struct.pack('B', bucket_id))
+                pipe_w.write(struct.pack('ff', cx, cy))
             pipe_w.flush()
+        except (BlockingIOError, BrokenPipeError, OSError):
+            pass
         except Exception as e:
             print(f"管道发送错误: {e}")
             running = False
@@ -187,7 +202,6 @@ def pipe_sender_worker():
 
 # ---------- 显示线程 ----------
 def display_worker():
-    """固定帧率显示，不影响推理速度"""
     global running
     if not USE_DISPLAY:
         return
@@ -202,11 +216,10 @@ def display_worker():
         if not disp_queue.empty():
             frame = disp_queue.get()
             cv2.imshow("Detection", frame)
-            if cv2.waitKey(1) == 27:   # ESC 退出
+            if cv2.waitKey(1) == 27:
                 running = False
                 break
         else:
-            # 没有新帧时按固定节奏等待
             time.sleep(delay)
 
     cv2.destroyAllWindows()
@@ -216,9 +229,7 @@ def display_worker():
 def main():
     global running, pipe_w
 
-    # 启动所有线程
     threads = []
-
     t_cap = threading.Thread(target=capture_worker, daemon=True)
     t_cap.start()
     threads.append(t_cap)
@@ -237,16 +248,15 @@ def main():
         threads.append(t_disp)
 
     print("所有线程已启动，按 Ctrl+C 退出")
+    print("检测到桶时输出：bucketID (cx, cy)；无桶时输出 None")
 
     try:
-        # 保持主线程存活
         while running:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n用户中断")
         running = False
     finally:
-        # 等待所有线程结束
         for t in threads:
             t.join(timeout=1)
         if pipe_w:

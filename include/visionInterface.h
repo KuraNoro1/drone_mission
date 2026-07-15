@@ -4,57 +4,46 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <cstdint>
 #include "types.h"
 
-struct visionBinaryData {
-    float cx;
-    float cy;
-    float confidence;
-};
-
-class binaryVisionPipe {
+class multiBucketPipe {
 public:
-    explicit binaryVisionPipe(const std::string& path);
-    ~binaryVisionPipe();
+    explicit multiBucketPipe(const std::string& path);
+    ~multiBucketPipe();
 
     bool open();
     void close();
-    bool readLatest(visionBinaryData& data);
+    bool readLatest(multiBucketData& data);
     bool isOpen() const;
 
 private:
     std::string path_;
     int fd_;
+    std::vector<uint8_t> buffer_;
 };
 
-class visionPipe {
+class hDetectionPipe {
 public:
-    explicit visionPipe(const std::string& path, int imgW = 640, int imgH = 640);
-    ~visionPipe();
+    explicit hDetectionPipe(const std::string& path);
+    ~hDetectionPipe();
 
-    bool open(bool createPipe = true);
+    bool open();
     void close();
-
-    bool readLatest(detection& det);
-    std::vector<detection> readAll();
+    bool readLatest(double& cx, double& cy);
     bool isOpen() const;
-
-    int imageWidth() const;
-    int imageHeight() const;
-    double imageCx() const;
-    double imageCy() const;
 
 private:
     void readLoop();
     std::string path_;
-    int imgW_;
-    int imgH_;
     int fd_;
     std::atomic<bool> running_;
     std::thread readerThread_;
     mutable std::mutex mutex_;
-    detection latestDetection_;
+    double latestCx_;
+    double latestCy_;
     bool hasNewData_;
+    bool hasDetection_;
 };
 
 class missionCmdPipe {
