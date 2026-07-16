@@ -44,6 +44,7 @@ int main(int argc, char* argv[]) {
     }
 
     droneLink link(config.connection().url, config.connection().heartbeatTimeout);
+    link.enableAltitudePipe("/tmp/altitude_pipe");
     if (!link.connect()) {
         log("FATAL: Cannot connect to flight controller");
         return 1;

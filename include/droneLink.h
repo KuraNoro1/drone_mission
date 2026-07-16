@@ -6,6 +6,7 @@
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.hpp>
 #include <memory>
 #include <string>
+#include <atomic>
 #include "types.h"
 
 class droneLink {
@@ -18,6 +19,7 @@ public:
 
     double altitude() const;
     double distanceSensorM() const;
+    void enableAltitudePipe(const std::string& path);
     gpsCoord position() const;
     gpsOrigin getGpsOrigin() const;
     bool inAir() const;
@@ -45,4 +47,6 @@ private:
     gpsOrigin gpsOrigin_;
     bool connected_;
     double latestDistanceM_;
+    int altPipeFd_;
+    std::string altPipePath_;
 };

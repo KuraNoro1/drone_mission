@@ -2,6 +2,7 @@
 #include <memory>
 #include <fstream>
 #include <vector>
+#include <chrono>
 #include "types.h"
 #include "droneLink.h"
 #include "flightOps.h"
@@ -53,9 +54,12 @@ private:
     void computeMountPixels(double altitude, double& uL, double& vL,
                             double& uR, double& vR, double& radius);
     void gotoBucketFound(float wpN, float wpE, const bucketDetection& targetBucket);
+    bool checkDropZoneTimeout();
+    void forceDropAll();
 
     int  runVisualServoLoop(double targetAlt, double totalTimeout,
-                            const bucketDetection& targetBucket);
+                            const bucketDetection& targetBucket,
+                            const visualServoConfig& vsCfg);
     // returns: 0=timeout, 1=drops complete, 2=lost-search expired (resume waypoints)
 
     droneLink& link_;
@@ -74,7 +78,6 @@ private:
 
     std::unique_ptr<pidController> pidN_;
     std::unique_ptr<pidController> pidE_;
-    std::unique_ptr<pidController> pidD_;
 
     int reconWpIndex_;
     int dropSearchPhase_;
@@ -85,4 +88,5 @@ private:
 
     int dropCount_;
     std::vector<std::string> droppedSides_;
+    std::chrono::steady_clock::time_point dropZoneEnterTime_;
 };

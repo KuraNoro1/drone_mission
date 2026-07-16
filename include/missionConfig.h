@@ -13,9 +13,8 @@ public:
     const flightConfig& flight() const;
     const dropZoneConfig& dropZone() const;
     const reconZoneConfig& reconZone() const;
-    const pidPositionGains& pidXY() const;
-    const pidPositionGains& pidZ() const;
-    const pidConfig& pidVisual() const;
+    const dualLoopConfig& dualLoop() const;
+    const visualServoConfig& visualServo() const;
     const visionConfig& vision() const;
     const servoConfig& servo() const;
     const landingConfig& landing() const;
@@ -24,14 +23,12 @@ public:
 
 private:
     YAML::Node loadFile(const std::string& filename);
-
     void parseConnection(const YAML::Node& node);
     void parseFlight(const YAML::Node& node);
     void parseDropZone(const YAML::Node& node);
     void parseReconZone(const YAML::Node& node);
-    void parsePidXY(const YAML::Node& node);
-    void parsePidZ(const YAML::Node& node);
-    void parsePidVisual(const YAML::Node& node);
+    void parseDualLoop(const YAML::Node& node);
+    void parseVisualServo(const YAML::Node& node);
     void parseVision(const YAML::Node& node);
     void parseServo(const YAML::Node& node);
     void parseLanding(const YAML::Node& node);

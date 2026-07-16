@@ -17,6 +17,7 @@ set(SOURCE_FILES
     src/offboardControl.cpp
     src/servoControl.cpp
     src/pidController.cpp
+    src/dualLoopPid.cpp
     src/visionInterface.cpp
     src/missionConfig.cpp
     src/missionStateMachine.cpp
@@ -29,9 +30,17 @@ set(HEADER_FILES
     include/offboardControl.h
     include/servoControl.h
     include/pidController.h
+    include/dualLoopPid.h
     include/visionInterface.h
     include/missionConfig.h
     include/missionStateMachine.h
+)
+
+set(TEST_SOURCES
+    src/test_flight.cpp
+    src/droneLink.cpp
+    src/flightOps.cpp
+    src/missionConfig.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES} ${HEADER_FILES})
@@ -48,6 +57,25 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
+    ${MAVSDK_PKG_CFLAGS}
+    ${MAVSDK_PKG_CFLAGS_OTHER}
+    -Wall -O2
+)
+
+add_executable(testFlight ${TEST_SOURCES})
+
+target_include_directories(testFlight PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${MAVSDK_PKG_INCLUDE_DIRS}
+)
+
+target_link_libraries(testFlight PRIVATE
+    yaml-cpp::yaml-cpp
+    ${MAVSDK_PKG_LIBRARIES}
+    pthread
+)
+
+target_compile_options(testFlight PRIVATE
     ${MAVSDK_PKG_CFLAGS}
     ${MAVSDK_PKG_CFLAGS_OTHER}
     -Wall -O2

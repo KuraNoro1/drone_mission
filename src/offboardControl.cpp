@@ -48,6 +48,26 @@ bool offboardControl::startPositionMode() {
     return true;
 }
 
+bool offboardControl::startPositionModeAt(float north, float east,
+                                           float down, float yaw) {
+    if (active_) return true;
+
+    setPositionNed(north, east, down, yaw);
+    sleep_for(milliseconds(100));
+    setPositionNed(north, east, down, yaw);
+
+    auto result = link_.offboard().start();
+    if (result != Offboard::Result::Success) {
+        log("ERROR: Offboard position start failed");
+        return false;
+    }
+
+    active_ = true;
+    positionMode_ = true;
+    log("Offboard mode active (position)");
+    return true;
+}
+
 bool offboardControl::startVelocityMode() {
     if (active_ && positionMode_) {
         stop();
@@ -120,6 +140,69 @@ bool offboardControl::flyToPosition(float north, float east, float down, float y
             return false;
         }
         sleep_for(milliseconds(200));
+    }
+}
+
+bool offboardControl::flyToPosPid(float north, float east, float down, float yaw,
+                                   double distTolerance, int timeoutSec,
+                                   double posKp, double posMaxVel,
+                                   const std::string& description) {
+    if (!posPid_) {
+        posPid_ = std::make_unique<dualLoopPidController>(posKp, posMaxVel);
+    } else {
+        posPid_->setGains(posKp, posMaxVel);
+    }
+
+    if (!startVelocityMode()) return false;
+
+    log("[DUAL-LOOP] Flying: " + description +
+        "  posKp=" + std::to_string(posKp) +
+        "  maxVel=" + std::to_string(posMaxVel) + "m/s");
+
+    auto t0 = steady_clock::now();
+    auto lastTime = t0;
+
+    while (true) {
+        auto now = steady_clock::now();
+        double dt = duration<double>(now - lastTime).count();
+        lastTime = now;
+        if (dt > 1.0) dt = 0.05;
+
+        auto ned = link_.nedPosition();
+        auto vel = link_.nedVelocity();
+
+        double errN = north - ned.northM;
+        double errE = east  - ned.eastM;
+        double dist = std::hypot(errN, errE);
+
+        double cvx = 0, cvy = 0;
+        posPid_->update(errN, errE, vel.northM, vel.eastM, dt, cvx, cvy);
+
+        setVelocityNed(static_cast<float>(cvx), static_cast<float>(cvy), 0.0f, yaw);
+
+        static int logCount = 0;
+        if (++logCount % 5 == 0) {
+            std::cout << "  [POS-PID] dist=" << std::fixed << std::setprecision(1) << dist
+                      << "m  err=(" << std::setprecision(1) << errN << "," << errE
+                      << ")  vcmd=(" << cvx << "," << cvy
+                      << ")m/s  vel=(" << vel.northM << "," << vel.eastM << ")m/s" << std::endl;
+        }
+
+        if (dist <= distTolerance) {
+            double velMag = std::hypot(vel.northM, vel.eastM);
+            if (velMag < 0.2) {
+                setVelocityNed(0, 0, 0, yaw);
+                log("[DUAL-LOOP] Arrived: " + description +
+                    "  dist=" + std::to_string(dist).substr(0,4) +
+                    "m  vel=" + std::to_string(velMag).substr(0,4) + "m/s");
+                return true;
+            }
+        }
+        if (duration<double>(now - t0).count() > timeoutSec) {
+            log("[DUAL-LOOP] Timeout: " + description);
+            return false;
+        }
+        sleep_for(milliseconds(50));
     }
 }
 

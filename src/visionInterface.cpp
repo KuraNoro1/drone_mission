@@ -71,6 +71,7 @@ bool multiBucketPipe::readLatest(multiBucketData& data) {
     fcntl(fd_, F_SETFL, flags);
 
     bool got = false;
+    bool gotBuckets = false;  // 是否已在当前批次中找到有效桶数据
     size_t consumedUntil = 0;
 
     size_t offset = 0;
@@ -93,7 +94,14 @@ bool multiBucketPipe::readLatest(multiBucketData& data) {
 
         offset += msgSize;
         consumedUntil = offset;
-        data = parsed;
+
+        // 只保留最后一条 count>0 的消息, 丢弃中间的 count=0
+        if (count > 0) {
+            data = parsed;
+            gotBuckets = true;
+        } else if (!gotBuckets) {
+            data = parsed;  // 全是 count=0 时返回最后一条
+        }
         got = true;
     }
 

@@ -3,6 +3,11 @@
 #include <iomanip>
 #include <chrono>
 #include <thread>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <cstring>
+#include <cerrno>
 
 using namespace mavsdk;
 using namespace std::this_thread;
@@ -20,9 +25,12 @@ namespace {
 }
 
 droneLink::droneLink(const std::string& url, double heartbeatTimeout)
-    : url_(url), heartbeatTimeout_(heartbeatTimeout), connected_(false), latestDistanceM_(-1) {}
+    : url_(url), heartbeatTimeout_(heartbeatTimeout), connected_(false),
+      latestDistanceM_(-1), altPipeFd_(-1) {}
 
-droneLink::~droneLink() {}
+droneLink::~droneLink() {
+    if (altPipeFd_ >= 0) { ::close(altPipeFd_); altPipeFd_ = -1; }
+}
 
 bool droneLink::connect() {
     mavsdk_ = std::make_unique<Mavsdk>(Mavsdk::Configuration{ComponentType::CompanionComputer});
@@ -62,12 +70,35 @@ bool droneLink::connect() {
         latestDistanceM_ = ds.current_distance_m;
     });
 
+    if (altPipeFd_ >= 0) {
+        telemetry_->subscribe_position([this](Telemetry::Position pos) {
+            static int skip = 0;
+            if (++skip % 5 != 0) return;  // 10Hz → 2Hz 写入
+            std::string s = std::to_string(pos.relative_altitude_m) + "\n";
+            auto ret = ::write(altPipeFd_, s.c_str(), s.size());
+            (void)ret;
+        });
+    }
+
     connected_ = true;
     log("Connected. Mode=" + std::to_string(static_cast<int>(telemetry_->flight_mode())));
     return true;
 }
 
 bool droneLink::isConnected() const { return connected_; }
+
+void droneLink::enableAltitudePipe(const std::string& path) {
+    altPipePath_ = path;
+    ::unlink(path.c_str());
+    ::mkfifo(path.c_str(), 0666);
+    altPipeFd_ = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
+    if (altPipeFd_ < 0) {
+        log("WARNING: Cannot open altitude pipe: " + path +
+            " (" + std::string(strerror(errno)) + ")");
+    } else {
+        log("Altitude pipe opened: " + path);
+    }
+}
 
 double droneLink::altitude() const {
     return telemetry_->position().relative_altitude_m;

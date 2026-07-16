@@ -34,6 +34,12 @@ DISPLAY_FPS = 15
 THRESH_15_20 = 30
 THRESH_20_25 = 55
 
+# ── 相机内参 (与 C++ computeMountPixels 一致) ──
+FX = 554.26
+ALT_PIPE = "/tmp/altitude_pipe"
+CURRENT_ALTITUDE = 1.5  # 默认值, 管道更新后覆盖
+ALT_LOCK = threading.Lock()
+
 GST_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gz_gst_bridge.py")
 # ==========================================
 
@@ -78,12 +84,29 @@ fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 print("C++ 已连接")
 
 def classify_bucket_id(pixel_width):
-    if pixel_width < THRESH_15_20:
-        return 1
-    elif pixel_width < THRESH_20_25:
-        return 2
+    """根据像素宽度和实际高度估算真实直径, 再分类桶ID
+       与老方案 ros2_yolov8/detect.py 公式一致"""
+    with ALT_LOCK:
+        alt = CURRENT_ALTITUDE
+    if alt <= 0.1:
+        alt = 1.5
+
+    real_diameter_m = (pixel_width * alt) / FX
+
+    if 0.125 <= real_diameter_m <= 0.175:
+        return 1   # 15cm
+    elif 0.175 < real_diameter_m <= 0.225:
+        return 2   # 20cm
+    elif 0.225 < real_diameter_m <= 0.325:
+        return 3   # 25cm
     else:
-        return 3
+        # 回退到像素阈值判断
+        if pixel_width < THRESH_15_20:
+            return 1
+        elif pixel_width < THRESH_20_25:
+            return 2
+        else:
+            return 3
 
 def start_camera_bridge():
     global bridge_proc
@@ -218,6 +241,41 @@ def display_worker():
     cv2.destroyAllWindows()
     print("显示线程退出")
 
+# ---------- 高度管道读取线程 ----------
+def altitude_reader():
+    global running, CURRENT_ALTITUDE
+    if not os.path.exists(ALT_PIPE):
+        print(f"[ALT] {ALT_PIPE} 不存在, 等待 C++ 创建...")
+        for _ in range(50):
+            if os.path.exists(ALT_PIPE):
+                break
+            time.sleep(0.2)
+    try:
+        alt_fd = os.open(ALT_PIPE, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        print(f"[ALT] 无法打开 {ALT_PIPE}, 使用默认高度={CURRENT_ALTITUDE}m")
+        return
+    buf = b""
+    while running:
+        try:
+            data = os.read(alt_fd, 256)
+            if data:
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        h = float(line.strip())
+                        with ALT_LOCK:
+                            CURRENT_ALTITUDE = h
+                    except ValueError:
+                        pass
+            else:
+                time.sleep(0.05)
+        except BlockingIOError:
+            time.sleep(0.05)
+    os.close(alt_fd)
+    print("高度读取线程退出")
+
 def cleanup(sig=None, frame=None):
     global running
     running = False
@@ -239,6 +297,8 @@ def main():
     if USE_DISPLAY:
         t_disp = threading.Thread(target=display_worker, daemon=True)
         t_disp.start(); threads.append(t_disp)
+    t_alt = threading.Thread(target=altitude_reader, daemon=True)
+    t_alt.start(); threads.append(t_alt)
 
     print("所有线程已启动，按 Ctrl+C 退出")
     try:

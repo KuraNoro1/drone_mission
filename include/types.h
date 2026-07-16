@@ -29,7 +29,7 @@ struct detection {
 };
 
 struct bucketDetection {
-    int bucketId;   // 1=15cm, 2=20cm, 3=25cm
+    int bucketId;
     double cx;
     double cy;
 };
@@ -48,26 +48,9 @@ struct servoConfig {
     int releaseDurationMs;
 };
 
-struct pidGains {
-    double kp;
-    double ki;
-    double kd;
-    double maxOutput;
-    double maxIntegral;
-};
-
-struct pidConfig {
-    pidGains xy;
-    pidGains z;
-    double centerTolPx;
-    double holdTime;
-};
-
-struct pidPositionGains {
-    double kp;
-    double ki;
-    double kd;
-    double maxVel;
+struct dualLoopConfig {
+    double posKp;
+    double posMaxVel;
 };
 
 struct flightConfig {
@@ -118,6 +101,31 @@ struct landingConfig {
     int rtlTimeout;
 };
 
+struct visualServoConfig {
+    double kp;
+    double ki;
+    double kd;
+    double maxVelXY;
+    double fineVelMax;
+    double altKp;
+    double altMaxVel;
+    double searchAlt;           // 丢目标搜索时保持的高度 (m, 正=上)
+    int maxNoDetectFrames;
+    int lostBriefFrames;
+    int convergeFrames;
+    int holdFrames;
+    double altTolerance;
+    double velZeroTol;
+    double detectRateMin;
+    int detectWindow;
+    double lostSearchSpeed;
+    double lostSearchTimeout;
+    double convergeTol15cm;
+    double convergeTol20cm;
+    double convergeTol25cm;
+    double convergeTolDefault;
+};
+
 struct pidTestConfig {
     double testAlt;
     double leftOffsetM;
@@ -134,15 +142,14 @@ struct missionConfigData {
     flightConfig flight;
     dropZoneConfig dropZone;
     reconZoneConfig reconZone;
-    pidPositionGains pidXY;
-    pidPositionGains pidZ;
-    pidConfig pidVisual;
+    dualLoopConfig dualLoop;
+    visualServoConfig visualServo;
     visionConfig vision;
     servoConfig servo;
     landingConfig landing;
     pidTestConfig pidTest;
     projectPaths paths;
-    int missionPriority;   // 0=优先大桶(桶3), 1=优先小桶(桶1)
+    int missionPriority;
 };
 
 enum class missionState {

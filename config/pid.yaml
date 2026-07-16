@@ -1,22 +1,40 @@
-pidXY:
-  kp: 0.8
-  ki: 0.02
-  kd: 0.2
-  maxVel: 1.0
+# ── 双环水平位置 PID (参考 quadrotor_pid_design.md §3.1) ──
+# 外环位置 P: v_ref = Kp_pos · err → 速度命令
+# 内环速度 PI: ArduPilot/PX4 飞控内部处理
+dualLoop:
+  posKp: 0.8       # 位置环P增益 (m/s per m error)
+  posMaxVel: 2.0   # 位置环输出速度限幅 (m/s)
 
-pidZ:
-  kp: 0.5
-  ki: 0.01
-  kd: 0.1
-  maxVel: 0.5
+# ── 视觉伺服 PI 与行为参数 ──
+# kd=0 符合设计文档 §6.2: 视觉伺服不宜用 D 项
+visualServo:
+  kp: 0.8            # P增益: 归一化像素误差→速度 (m/s)
+  ki: 0.02           # I增益: 消除相机安装偏差
+  kd: 0.0            # D增益: =0, YOLO检测框抖动会放大噪声
+  maxVelXY: 0.5      # 搜索/跟踪阶段最大水平速度 (m/s)
+  fineVelMax: 0.2    # CONVERGED 阶段最大水平速度 (m/s)
+  altKp: 0.8         # 高度P增益 (m/s per m error), NED: vz=altKp×(alt−target)
+  altMaxVel: 0.5     # 高度纠正最大速度 (m/s)
+  searchAlt: 2.0     # 丢目标后搜索保持高度 (m)
 
-pidVisual:
-  kp: 0.8
-  ki: 0.0
-  kd: 0.15
-  maxVelXY: 1.0
-  kpZ: 0.3
-  kdZ: 0.05
-  maxVelZ: 0.5
-  centerTolPx: 40
-  holdTime: 0.5
+  # 目标检测丢失与状态切换
+  maxNoDetectFrames: 40   # 连续丢帧判定目标丢失 (40×50ms=2.0s, 仿真检测率低需放宽)
+  lostBriefFrames: 20     # 短暂丢帧容忍
+  convergeFrames: 10      # TRACKING→CONVERGED 需连续对准帧数
+  holdFrames: 30          # CONVERGED→READY_DROP 需稳定帧数 (30×50ms=1.5s)
+
+  # 投弹条件
+  altTolerance: 0.2       # 高度误差容差 (m)
+  velZeroTol: 0.15        # 静止速度阈值 (m/s)
+  detectRateMin: 0.4      # 最低检测率
+  detectWindow: 60        # 检测率滑动窗口帧数
+
+  # 丢目标后搜索
+  lostSearchSpeed: 0.5    # 搜索飞行速度 (m/s)
+  lostSearchTimeout: 3.0  # 搜索最大时间 (s)
+
+  # 按桶尺寸的收敛像素容差 (小桶容差大 / 大桶容差小)
+  convergeTol15cm: 45
+  convergeTol20cm: 35
+  convergeTol25cm: 25
+  convergeTolDefault: 30
