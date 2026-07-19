@@ -36,6 +36,13 @@ THRESH_20_25 = 55
 
 # ── 相机内参 (与 C++ computeMountPixels 一致, 真机需实测更新) ──
 FX = 554.26
+FY = 554.26
+CX = 320
+CY = 320
+CAM_DX, CAM_DY = 0.15, 0.0
+MNT_LX, MNT_LY = -0.07, 0.001
+MNT_RX, MNT_RY = 0.07, -0.001
+WORLD_R = 0.10
 ALT_PIPE = "/tmp/altitude_pipe"
 CURRENT_ALTITUDE = 1.5  # 默认值, 管道更新后覆盖
 ALT_LOCK = threading.Lock()
@@ -112,6 +119,56 @@ def classify_bucket_id(pixel_width):
         else:
             return 3
 
+
+# ---------- 挂载点像素投影 (与 C++ computeMountPixels 一致) ----------
+def compute_mount_pixels(altitude):
+    if altitude < 0.1:
+        altitude = 0.1
+    uL = CX + FX * (MNT_LX - CAM_DX) / altitude
+    vL = CY + FY * (MNT_LY - CAM_DY) / altitude
+    uR = CX + FX * (MNT_RX - CAM_DX) / altitude
+    vR = CY + FY * (MNT_RY - CAM_DY) / altitude
+    radius = WORLD_R * FX / altitude
+    return uL, vL, uR, vR, radius
+
+
+def draw_mount_points(img):
+    """在图像上绘制挂载点投影标记 (与 gz_gst_bridge.py _drawMountCircles 风格一致)"""
+    with ALT_LOCK:
+        alt = CURRENT_ALTITUDE
+    pts = compute_mount_pixels(alt)
+    if pts is None:
+        return
+    uL, vL, uR, vR, radius = pts
+
+    h, w = img.shape[:2]
+    scale_x = w / 640.0
+    scale_y = h / 640.0
+    r = int(max(radius * scale_x, 3))
+
+    uL_s = int(uL * scale_x)
+    vL_s = int(vL * scale_y)
+    uR_s = int(uR * scale_x)
+    vR_s = int(vR * scale_y)
+
+    # 左挂载点 — 红色圆圈 + 中心点
+    cv2.circle(img, (uL_s, vL_s), r, (0, 0, 255), 2)
+    cv2.circle(img, (uL_s, vL_s), 3, (0, 0, 255), -1)
+    cv2.putText(img, "L", (uL_s - 20, vL_s - r - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    # 右挂载点 — 绿色圆圈 + 中心点
+    cv2.circle(img, (uR_s, vR_s), r, (0, 255, 0), 2)
+    cv2.circle(img, (uR_s, vR_s), 3, (0, 255, 0), -1)
+    cv2.putText(img, "R", (uR_s - 20, vR_s - r - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    # HUD: 高度 + 半径
+    cv2.putText(img, f"H={alt:.2f}m r={r}px",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    cv2.putText(img, f"L:({uL:.0f},{vL:.0f}) R:({uR:.0f},{vR:.0f})",
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
 # ---------- 采集线程 ----------
 def capture_worker():
     global running
@@ -173,6 +230,8 @@ def inference_worker():
             cv2.circle(result_frame, (int(cx), int(cy)), 5, (0, 0, 255), -1)
             cv2.putText(result_frame, f"bucket{bucket_id}", (int(x1), int(y1)-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        draw_mount_points(result_frame)
 
         if len(bucket_list) == 0:
             print("None")

@@ -1,5 +1,5 @@
 #pragma once
-#include "pidController.h"
+#include "control/pidController.h"
 
 class dualLoopPidController {
 public:

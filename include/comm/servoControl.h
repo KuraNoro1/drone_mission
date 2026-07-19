@@ -1,6 +1,6 @@
 #pragma once
-#include "droneLink.h"
-#include "types.h"
+#include "comm/droneLink.h"
+#include "mission/types.h"
 
 class servoControl {
 public:

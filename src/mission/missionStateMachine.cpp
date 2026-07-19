@@ -21,15 +21,17 @@ namespace {
     }
 }
 
-// 前向声明 (定义在 200 行后)
-static bucketDetection selectTargetBucket(const multiBucketData& data, int priority);
+// 前向声明
+static bucketDetection selectTargetBucket(const multiBucketData& data, int priority, int lockedId = 0);
 static const char* bucketIdToLabel(int id);
 
 missionStateMachine::missionStateMachine(droneLink& link, const missionConfigData& config)
     : link_(link), config_(config), state_(missionState::init), running_(false),
       initYaw_(0), missionPriority_(0), reconWpIndex_(0), dropSearchPhase_(0),
       bucketFound_(false), hasLastTarget_(false), dropCount_(0),
-      dropZoneEnterTime_(steady_clock::now()) {
+      dropZoneEnterTime_(steady_clock::now()),
+      stableDetectCount_(0), lastDetectTargetId_(0),
+      searchCooldownStart_(steady_clock::now()) {
     lastMultiData_ = {0, {}};
     lastTargetBucket_ = {0, 0, 0};
 }
@@ -57,6 +59,42 @@ bool missionStateMachine::init() {
     hPipe_ = std::make_unique<hDetectionPipe>("/tmp/h_pipe");
     hPipe_->open();
 
+    bombSystem_ = std::make_unique<BombDropSystem>(link_, *offboard_, *servo_, *bucketPipe_);
+    {
+        DropConfig dropCfg;
+        const auto& vsCfg = config_.visualServo;
+        dropCfg.searchAlt       = 3.5;
+        dropCfg.approachAlt     = 1.4;
+        dropCfg.dropAlt         = 1.0;
+        dropCfg.gotoTimeout     = 10.0;
+        dropCfg.stableDuration  = 0.5;
+        dropCfg.velZeroTol      = vsCfg.velZeroTol;
+        dropCfg.altTolerance    = vsCfg.altTolerance;
+        dropCfg.releaseDurationMs = static_cast<double>(config_.servo.releaseDurationMs);
+        dropCfg.leftChannel     = config_.servo.leftChannel;
+        dropCfg.rightChannel    = config_.servo.rightChannel;
+        dropCfg.releasePwm      = config_.servo.releasePwm;
+        dropCfg.holdPwm         = config_.servo.holdPwm;
+        dropCfg.kpXY            = vsCfg.kp;
+        dropCfg.kpZ             = vsCfg.altKp;
+        dropCfg.maxVelXY        = vsCfg.maxVelXY;
+        dropCfg.maxVelZ         = vsCfg.altMaxVel;
+        dropCfg.convergeTolPx   = 20.0;
+
+        CameraIntrinsics camIntrinsics;
+        camIntrinsics.fx = 554.26;
+        camIntrinsics.fy = 554.26;
+        camIntrinsics.cx = 320;
+        camIntrinsics.cy = 320;
+
+        CameraExtrinsics camExtrinsics;
+        camExtrinsics.offsetForward = 0.15;
+        camExtrinsics.offsetRight   = 0.0;
+        camExtrinsics.offsetDown    = 0.0;
+
+        bombSystem_->configure(dropCfg, camIntrinsics, camExtrinsics, missionPriority_);
+    }
+
     missionPriority_ = config_.missionPriority;
     log("Mission priority: " + std::to_string(missionPriority_) +
         " (" + (missionPriority_ == 1 ? "small bucket first" : "big bucket first") + ")");
@@ -64,6 +102,11 @@ bool missionStateMachine::init() {
     sleep_for(seconds(2));
     initYaw_ = link_.headingDeg();
     log("Initial heading locked: " + std::to_string(initYaw_) + " deg");
+
+    log("========================================");
+    log("  All systems ready. Press ENTER to ARM.");
+    log("========================================");
+    std::cin.get();
 
     setState(missionState::arming);
     return true;
@@ -166,27 +209,11 @@ void missionStateMachine::handleTransitToDrop() {
     }
 
     auto t0 = steady_clock::now();
-    double transitTime = 30.0;
+    double transitTime = 15.0;
     while (running_ && link_.isConnected() &&
            duration<double>(steady_clock::now() - t0).count() < transitTime) {
         offboard_->setPositionNed(dN, dE, -alt, initYaw_);
-
-        // 途中轮询管道: 一旦发现桶立即转入视觉伺服
-        multiBucketData vis;
-        if (bucketPipe_->readLatest(vis) && !vis.empty()) {
-            auto target = selectTargetBucket(vis, missionPriority_);
-            log("[TRANSIT] Bucket detected en route! → enter visual servo");
-            dropZoneEnterTime_ = steady_clock::now();
-            bucketFound_ = true;
-            lastTargetBucket_ = target;
-            hasLastTarget_ = true;
-            dropSearchPhase_ = 0;
-            dropCount_ = 0;
-            droppedSides_.clear();
-            setState(missionState::dropVisualServo);
-            return;
-        }
-        sleep_for(milliseconds(100));
+        sleep_for(milliseconds(200));
     }
 
     if (!running_ || !link_.isConnected()) {
@@ -199,6 +226,7 @@ void missionStateMachine::handleTransitToDrop() {
     hasLastTarget_ = false;
     dropCount_ = 0;
     droppedSides_.clear();
+    bombSystem_->reset();
     setState(missionState::dropSearch);
 }
 
@@ -228,8 +256,13 @@ void missionStateMachine::computeMountPixels(double altitude,
 // priority=0 对应老方案 shot_big_target=true  (保守模式, 优先大桶)
 // priority=1 对应老方案 shot_big_target=false (激进模式, 优先小桶)
 
-static bucketDetection selectTargetBucket(const multiBucketData& data, int priority) {
+static bucketDetection selectTargetBucket(const multiBucketData& data, int priority, int lockedId) {
     if (data.empty()) return {0, 0, 0};
+
+    if (lockedId > 0) {
+        for (const auto& b : data.buckets) if (b.bucketId == lockedId) return b;
+        return {0, 0, 0};
+    }
 
     if (priority == 1) {
         // 激进模式：优先小桶（桶1=15cm），不存在则退而求其次
@@ -272,6 +305,16 @@ bool missionStateMachine::waitForDetection(double timeoutSec, multiBucketData& o
         if (got) {
             pipeReadSuccess++;
             if (!vis.empty()) {
+                auto ned = link_.nedPosition();
+                double distFromOrigin = std::hypot(ned.northM, ned.eastM);
+                if (distFromOrigin < 28.0) {
+                    if (loopCount % 50 == 0) {
+                        log("[WAIT_DETECT] Ignoring detection within 28m filter (dist=" +
+                            std::to_string((int)distFromOrigin) + "m)");
+                    }
+                    sleep_for(milliseconds(100));
+                    continue;
+                }
                 auto target = selectTargetBucket(vis, missionPriority_);
                 std::ostringstream oss;
                 oss << "[WAIT_DETECT] FOUND " << vis.count << " bucket(s):";
@@ -300,38 +343,80 @@ bool missionStateMachine::waitForDetection(double timeoutSec, multiBucketData& o
     return false;
 }
 
-// ── 投放区搜索 (持续发送位置设定点 + 非阻塞轮询管道) ──
+// ── 投放区：委托 BombDropSystem 执行全部投弹逻辑 ──
 
 void missionStateMachine::handleDropSearch() {
     float dN = static_cast<float>(config_.dropZone.centerNorth);
     float dE = static_cast<float>(config_.dropZone.centerEast);
-    float searchAlt = 3.0f;
+    float searchAlt = 3.5f;
 
-    if (checkDropZoneTimeout()) {
-        if (!offboard_->isActive()) {
-            offboard_->startPositionModeAt(dN, dE, -searchAlt, initYaw_);
-        }
-        forceDropAll();
-        setState(missionState::transitToRecon);
-        return;
-    }
-
+    // 首次进入时确保位置模式
     if (!offboard_->isActive()) {
         offboard_->startPositionModeAt(dN, dE, -searchAlt, initYaw_);
     }
     offboard_->setPositionNed(dN, dE, -searchAlt, initYaw_);
 
-    multiBucketData detectedData;
-    bool got = bucketPipe_->readLatest(detectedData);
-
-    if (got && !detectedData.empty()) {
-        auto target = selectTargetBucket(detectedData, missionPriority_);
-        log("[DROP_SEARCH] Bucket detected → enter visual servo");
-        gotoBucketFound(dN, dE, target);
+    // 28m 距离滤波
+    auto ned = link_.nedPosition();
+    double distFromOrigin = std::hypot(ned.northM, ned.eastM);
+    if (distFromOrigin < 28.0) {
+        log("[DROP] Within 28m filter (dist=" + std::to_string((int)distFromOrigin) + "m), waiting...");
+        sleep_for(milliseconds(100));
         return;
     }
 
-    sleep_for(milliseconds(100));
+    double elapsed = duration<double>(steady_clock::now() - dropZoneEnterTime_).count();
+    double remaining = 90.0 - elapsed;
+    if (remaining <= 0) {
+        log("[DROP] Drop zone timeout, forcing drops");
+        offboard_->stop();
+        sleep_for(milliseconds(300));
+        forceDropAll();
+        setState(missionState::transitToRecon);
+        return;
+    }
+
+    log("[DROP] Starting BombDropSystem (remaining=" +
+        std::to_string(remaining).substr(0,4) + "s)");
+
+    BombDropResult result = bombSystem_->execute(remaining, initYaw_);
+
+    // 稳定爬升: 投弹后从~1m爬到searchAlt, 避免真空期坠毁
+    offboard_->stop();
+    sleep_for(milliseconds(300));
+    offboard_->startPositionModeAt(dN, dE, -searchAlt, initYaw_);
+    log("[DROP] Stabilizing at " + std::to_string(searchAlt) + "m before recon...");
+
+    auto stabilizeT0 = steady_clock::now();
+    while (duration<double>(steady_clock::now() - stabilizeT0).count() < 5.0) {
+        offboard_->setPositionNed(dN, dE, -searchAlt, initYaw_);
+        double alt = link_.altitude();
+        if (alt > searchAlt - 0.3) {
+            log("[DROP] Stabilized at " + std::to_string(alt).substr(0,4) + "m");
+            break;
+        }
+        sleep_for(milliseconds(200));
+    }
+
+    log("[DROP] BombDropSystem finished: drops=" +
+        std::to_string(result.dropsCompleted) + "/2 timedOut=" +
+        (result.timedOut ? "yes" : "no"));
+    dropCount_ = result.dropsCompleted;
+
+    if (dropCount_ < 2) {
+        log("[DROP] Incomplete drops, forcing remaining");
+        while (dropCount_ < 2) {
+            int ch = (dropCount_ == 0) ? config_.servo.leftChannel
+                                       : config_.servo.rightChannel;
+            servo_->setPwm(ch, config_.servo.releasePwm);
+            sleep_for(milliseconds(static_cast<int>(config_.servo.releaseDurationMs)));
+            servo_->setPwm(ch, config_.servo.holdPwm);
+            dropCount_++;
+            sleep_for(milliseconds(300));
+        }
+    }
+
+    setState(missionState::transitToRecon);
 }
 
 void missionStateMachine::gotoBucketFound(float wpN, float wpE, const bucketDetection& targetBucket) {
@@ -403,6 +488,16 @@ bool missionStateMachine::flyToWithPipeCheck(
             if (got) {
                 pipeSuccess++;
                 if (!vis.empty()) {
+                    auto nedF = link_.nedPosition();
+                    double distFromOrigin = std::hypot(nedF.northM, nedF.eastM);
+                    if (distFromOrigin < 28.0) {
+                        if (loopCount % 25 == 0) {
+                            log("[FLY_PIPE] Ignoring detection within 28m filter (dist=" +
+                                std::to_string((int)distFromOrigin) + "m)");
+                        }
+                        sleep_for(milliseconds(200));
+                        continue;
+                    }
                     auto target = selectTargetBucket(vis, missionPriority_);
                     std::ostringstream oss;
                     oss << "[FLY_PIPE] BUCKET DETECTED en route! count=" << vis.count
@@ -439,67 +534,23 @@ bool missionStateMachine::flyToWithPipeCheck(
     return false;
 }
 
-// ── 视觉伺服对准 (最大 70s, 参考老方案 doshot 超时) ──────
+// ── 视觉伺服 (legacy: 新架构中不再使用此路径) ──────
 
 void missionStateMachine::handleDropVisualServo() {
-    if (!hasLastTarget_) {
-        log("[VSERVO] ERROR: No target bucket saved");
-        setState(missionState::transitToRecon);
-        return;
-    }
-    bucketDetection targetBucket = lastTargetBucket_;
-    log("[VSERVO] Visual servo targeting 桶" + std::to_string(targetBucket.bucketId) +
-        " " + bucketIdToLabel(targetBucket.bucketId) +
-        " @(" + std::to_string(targetBucket.cx) + "," + std::to_string(targetBucket.cy) + ")" +
-        "  drops completed: " + std::to_string(dropCount_) + "/2");
-
-    double dropAlt = config_.flight.dropAlt;
-    const visualServoConfig& vsCfg = config_.visualServo;
-
-    double elapsed = duration<double>(steady_clock::now() - dropZoneEnterTime_).count();
-    double remaining = 90.0 - elapsed;
-    if (remaining <= 0) {
-        forceDropAll();
-    } else {
-        int result = runVisualServoLoop(dropAlt, std::min(70.0, remaining), targetBucket, vsCfg);
-
-        offboard_->stop();
-        sleep_for(milliseconds(300));
-
-        // 立即恢复位置模式保持高度, 避免状态切换真空期坠落
-        float dN = static_cast<float>(config_.dropZone.centerNorth);
-        float dE = static_cast<float>(config_.dropZone.centerEast);
-        offboard_->startPositionModeAt(dN, dE, -3.0f, initYaw_);
-
-        if (result == 0) {
-            if (dropCount_ > 0) {
-                log("[VSERVO] Timeout with partial drops, moving to recon");
-            } else {
-                log("[VSERVO] Timeout, resuming search");
-                bucketFound_ = false;
-                dropSearchPhase_++;
-                setState(missionState::dropSearch);
-                return;
-            }
-        } else if (result == 2) {
-            log("[VSERVO] Lost-search expired, resuming search");
-            bucketFound_ = false;
-            dropSearchPhase_++;
-            setState(missionState::dropSearch);
-            return;
-        } else {
-            log("[VSERVO] All drops completed, moving to recon");
-        }
-    }
-
+    log("[VSERVO] Legacy path - redirecting to recon");
     setState(missionState::transitToRecon);
 }
 
-int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeout,
+int missionStateMachine::runVisualServoLoop(double /*targetAlt*/, double totalTimeout,
                                               const bucketDetection& targetBucket,
                                               const visualServoConfig& vsCfg) {
-    log("[VSERVO_LOOP] Starting visual servo, targetAlt=" + std::to_string(targetAlt) +
-        "m, lostTimeout=" + std::to_string(vsCfg.lostSearchTimeout) + "s");
+    const double SEARCH_ALT = 3.5;
+    const double DROP_ALT   = 1.0;
+    const double DROP_ALT_THRESHOLD  = DROP_ALT + 0.2;
+    const double SEARCH_ALT_THRESHOLD = SEARCH_ALT - 0.3;
+
+    log("[VSERVO_LOOP] Starting, searchAlt=3.5m dropAlt=1.0m lostTimeout=" +
+        std::to_string(vsCfg.lostSearchTimeout) + "s");
 
     if (!offboard_->startVelocityMode()) {
         log("[VSERVO_LOOP] ERROR: Cannot start velocity mode");
@@ -525,6 +576,11 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
     const double LOST_SEARCH_SPEED      = vsCfg.lostSearchSpeed;
     const double LOST_SEARCH_TIMEOUT    = vsCfg.lostSearchTimeout;
 
+    // 高度阶段：锁3.5m → 跟3.5m → 下降 → 判断1m → 爬升回3.5m
+    enum class DropPhase { LOCK_HIGH, TRACK_HIGH, DESCEND, JUDGE_1M, CLIMB };
+    DropPhase altPhase = DropPhase::LOCK_HIGH;
+    int lockedBucketId = 0;
+
     VisualServoState vsState = VisualServoState::SEARCHING;
     std::string sideSelected = "";
 
@@ -536,16 +592,15 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
 
     bucketDetection lastValidTarget = targetBucket;
     int noDetectFrames = 0;
-    int lostBriefFrames = 0;       // 老方案 circle_counter 等价: 短暂丢失计数
+    int lostBriefFrames = 0;
     bool targetLost = false;
-    bool targetLostBrief = false;  // 短暂丢失标志 (< LOST_BEFORE_SEARCH 帧)
+    bool targetLostBrief = false;
 
-    // 收敛容差: 根据桶ID选择对应配置值
     double convergeTolPx = vsCfg.convergeTolDefault;
     switch (targetBucket.bucketId) {
-        case 1: convergeTolPx = vsCfg.convergeTol15cm;    log("[VSERVO_LOOP] Bucket 15cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
-        case 2: convergeTolPx = vsCfg.convergeTol20cm;    log("[VSERVO_LOOP] Bucket 20cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
-        case 3: convergeTolPx = vsCfg.convergeTol25cm;    log("[VSERVO_LOOP] Bucket 25cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
+        case 1: convergeTolPx = vsCfg.convergeTol15cm; log("[VSERVO_LOOP] Bucket 15cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
+        case 2: convergeTolPx = vsCfg.convergeTol20cm; log("[VSERVO_LOOP] Bucket 20cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
+        case 3: convergeTolPx = vsCfg.convergeTol25cm; log("[VSERVO_LOOP] Bucket 25cm: tol=" + std::to_string(convergeTolPx) + "px"); break;
         default: convergeTolPx = vsCfg.convergeTolDefault; break;
     }
 
@@ -586,39 +641,111 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
 
         if (hasDet && !vis.empty()) {
             pipeFound++;
-            // 始终用标签优先选择当前帧最大桶, 不再死推算
-            bucketDetection foundTarget = selectTargetBucket(vis, missionPriority_);
+        }
 
-            if (!hasLastTarget_ || lastTargetBucket_.bucketId == 0) {
-                log("[VSERVO_LOOP] First lock on 桶" + std::to_string(foundTarget.bucketId) +
-                    " @(" + std::to_string((int)foundTarget.cx) + "," +
-                    std::to_string((int)foundTarget.cy) + ")");
+        bool acceptDetection = false;
+        if (hasDet && !vis.empty()) {
+            if (lockedBucketId == 0) {
+                auto nedPos = link_.nedPosition();
+                double distFromOrigin = std::hypot(nedPos.northM, nedPos.eastM);
+                if (distFromOrigin < 28.0) {
+                    if (loopCount % 50 == 0) {
+                        log("[VSERVO_LOOP] Ignoring detection within 28m filter (dist=" +
+                            std::to_string((int)distFromOrigin) + "m)");
+                    }
+                } else {
+                    acceptDetection = true;
+                }
+            } else {
+                acceptDetection = true;
             }
+        }
 
-            noDetectFrames = 0;
-            lostBriefFrames = 0;
-            targetLostBrief = false;
-            freshDetection = true;
+        if (acceptDetection) {
+            bucketDetection foundTarget = selectTargetBucket(vis, missionPriority_, lockedBucketId);
 
-            if (targetLost) {
-                log("[VSERVO_LOOP] Re-detected 桶" + std::to_string(foundTarget.bucketId) +
-                    " " + bucketIdToLabel(foundTarget.bucketId) +
-                    " @(" + std::to_string(foundTarget.cx) + "," + std::to_string(foundTarget.cy) +
-                    "), resuming tracking");
-                targetLost = false;
+            if (foundTarget.bucketId > 0) {
+                if (lockedBucketId == 0) {
+                    lockedBucketId = foundTarget.bucketId;
+                    log("[VSERVO_LOOP] Locked onto 桶" + std::to_string(lockedBucketId) +
+                        " " + bucketIdToLabel(lockedBucketId) +
+                        " @(" + std::to_string((int)foundTarget.cx) + "," +
+                        std::to_string((int)foundTarget.cy) + "), filtering only this bucket");
+                    if (altPhase == DropPhase::LOCK_HIGH) {
+                        altPhase = DropPhase::TRACK_HIGH;
+                        log("[VSERVO_LOOP] Phase: LOCK -> TRACK");
+                    }
+                }
+
+                noDetectFrames = 0;
+                lostBriefFrames = 0;
                 targetLostBrief = false;
-                searchMode = false;
-            }
+                freshDetection = true;
 
-            lastValidTarget = foundTarget;
-            lastTargetBucket_ = foundTarget;
-            curTarget = foundTarget;
+                if (targetLost) {
+                    log("[VSERVO_LOOP] Re-detected 桶" + std::to_string(foundTarget.bucketId) +
+                        " " + bucketIdToLabel(foundTarget.bucketId) +
+                        " @(" + std::to_string((int)foundTarget.cx) + "," +
+                        std::to_string((int)foundTarget.cy) + "), resuming");
+                    targetLost = false;
+                    targetLostBrief = false;
+                    searchMode = false;
+                }
+
+                lastValidTarget = foundTarget;
+                lastTargetBucket_ = foundTarget;
+                curTarget = foundTarget;
+            } else {
+                noDetectFrames++;
+                lostBriefFrames++;
+
+                if (lostBriefFrames <= LOST_BEFORE_SEARCH) {
+                    targetLostBrief = true;
+                } else {
+                    targetLostBrief = false;
+                }
+
+                if (noDetectFrames >= MAX_NO_DETECT_FRAMES) {
+                    if (!targetLost) {
+                        log("[VSERVO_LOOP] Locked bucket lost after " +
+                            std::to_string(noDetectFrames) + " frames (briefLost=" +
+                            std::to_string(lostBriefFrames) +
+                            "), starting lost-search at " +
+                            std::to_string(LOST_SEARCH_SPEED) + "m/s");
+
+                        double uL, vL, uR, vR, radius;
+                        computeMountPixels(alt, uL, vL, uR, vR, radius);
+                        double dL = std::hypot(lastValidTarget.cx - uL, lastValidTarget.cy - vL);
+                        double dR = std::hypot(lastValidTarget.cx - uR, lastValidTarget.cy - vR);
+                        double refU = (dL <= dR) ? uL : uR;
+                        double refV = (dL <= dR) ? vL : vR;
+
+                        searchDirX = lastValidTarget.cx - refU;
+                        searchDirY = lastValidTarget.cy - refV;
+                        double dirMag = std::hypot(searchDirX, searchDirY);
+                        if (dirMag > 1.0) {
+                            searchDirX /= dirMag;
+                            searchDirY /= dirMag;
+                        } else {
+                            searchDirX = 0;
+                            searchDirY = 1.0;
+                        }
+
+                        targetLost = true;
+                        searchMode = true;
+                        searchStartTime = now;
+                        pidN_->reset();
+                        pidE_->reset();
+                    }
+                    curTarget = {0, 0, 0};
+                } else {
+                    curTarget = lastValidTarget;
+                }
+            }
         } else {
             noDetectFrames++;
             lostBriefFrames++;
 
-            // 参考老方案: circle_counter >= 12 → 使用最近位置继续, 但保持搜索
-            // 短暂丢失 (< LOST_BEFORE_SEARCH帧) → 仍然认为目标"存在", 继续用最近位置
             if (lostBriefFrames <= LOST_BEFORE_SEARCH) {
                 targetLostBrief = true;
             } else {
@@ -632,7 +759,6 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         "), starting lost-search at " +
                         std::to_string(LOST_SEARCH_SPEED) + "m/s");
 
-                    // 计算搜索方向: 从挂载点指向最后检测到的桶位置
                     double uL, vL, uR, vR, radius;
                     computeMountPixels(alt, uL, vL, uR, vR, radius);
                     double dL = std::hypot(lastValidTarget.cx - uL, lastValidTarget.cy - vL);
@@ -648,12 +774,8 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         searchDirY /= dirMag;
                     } else {
                         searchDirX = 0;
-                        searchDirY = 1.0;   // 默认向前飞
+                        searchDirY = 1.0;
                     }
-
-                    log("[VSERVO_LOOP] Search direction: (" +
-                        std::to_string(searchDirX).substr(0,5) + "," +
-                        std::to_string(searchDirY).substr(0,5) + ")");
 
                     targetLost = true;
                     searchMode = true;
@@ -667,10 +789,16 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
             }
         }
 
-        // 高度保持参考: 跟踪时=投弹高度, 搜索/丢目标时=搜索高度
-        double altRef = (curTarget.bucketId > 0 && !searchMode) ? targetAlt : vsCfg.searchAlt;
+        double altRef;
+        switch (altPhase) {
+            case DropPhase::LOCK_HIGH:   altRef = SEARCH_ALT; break;
+            case DropPhase::TRACK_HIGH:  altRef = SEARCH_ALT; break;
+            case DropPhase::DESCEND:   altRef = DROP_ALT; break;
+            case DropPhase::JUDGE_1M:  altRef = DROP_ALT; break;
+            case DropPhase::CLIMB:     altRef = SEARCH_ALT; break;
+            default:                   altRef = SEARCH_ALT; break;
+        }
 
-        // ── 更新检测率滑动窗口 ──
         detectWinSum -= detectWindow[detectWinIdx];
         detectWindow[detectWinIdx] = freshDetection ? 1 : 0;
         detectWinSum += detectWindow[detectWinIdx];
@@ -695,15 +823,13 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
             double errPxV = tgtV - curTarget.cy;
             double absErr = std::hypot(errPxU, errPxV);
 
-            // ── 子状态机转换 ──
-            // 参考老方案: circle_counter < 12 时继续使用最近位置, 不重置状态
             switch (vsState) {
                 case VisualServoState::SEARCHING:
                     if (!targetLost && freshDetection && absErr < 200) {
                         vsState = VisualServoState::TRACKING;
                         convergeCounter = 0;
                         holdCounter = 0;
-                        log("[VSERVO] SEARCHING → TRACKING");
+                        log("[VSERVO] SEARCHING -> TRACKING");
                     }
                     break;
 
@@ -713,12 +839,11 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         if (convergeCounter >= CONVERGE_FRAMES) {
                             vsState = VisualServoState::CONVERGED;
                             holdCounter = 0;
-                            log("[VSERVO] TRACKING → CONVERGED (err=" +
+                            log("[VSERVO] TRACKING -> CONVERGED (err=" +
                                 std::to_string((int)absErr) + "px < " +
                                 std::to_string((int)convergeTolPx) + "px)");
                         }
                     } else if (!freshDetection && targetLostBrief) {
-                        // 短暂丢失(<=12帧)不重置收敛计数, 匹配老方案 circle_counter 模式
                     } else {
                         convergeCounter = 0;
                     }
@@ -729,16 +854,15 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         vsState = VisualServoState::SEARCHING;
                         convergeCounter = 0;
                         holdCounter = 0;
-                        log("[VSERVO] CONVERGED → SEARCHING (target fully lost)");
+                        log("[VSERVO] CONVERGED -> SEARCHING (target fully lost)");
                     } else if (freshDetection && absErr < convergeTolPx) {
                         holdCounter++;
                         if (holdCounter >= HOLD_FRAMES) {
                             vsState = VisualServoState::READY_DROP;
-                            log("[VSERVO] CONVERGED → READY_DROP (stable " +
+                            log("[VSERVO] CONVERGED -> READY_DROP (stable " +
                                 std::to_string(holdCounter) + " frames)");
                         }
                     } else if (targetLostBrief) {
-                        // 短暂丢失维持 CONVERGED 状态
                     } else {
                         convergeCounter = 0;
                         holdCounter = 0;
@@ -752,16 +876,16 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         convergeCounter = 0;
                         holdCounter = 0;
                         sideSelected = "";
-                        log("[VSERVO] READY_DROP → SEARCHING (target fully lost before drop)");
+                        log("[VSERVO] READY_DROP -> SEARCHING (target fully lost before drop)");
                     } else if (targetLostBrief) {
-                        // 短暂丢失维持 READY_DROP, 等待重新检测
                     }
                     break;
             }
 
-            // ── PID 控制 ──
             double velMax = vsCfg.maxVelXY;
-            if (vsState >= VisualServoState::CONVERGED) {
+            if (altPhase != DropPhase::DESCEND &&
+                altPhase != DropPhase::CLIMB &&
+                vsState >= VisualServoState::CONVERGED) {
                 velMax = FINE_VEL_MAX;
             }
 
@@ -771,35 +895,42 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
             vx = pidN_->update(errNormV, dt);
             vy = pidE_->update(-errNormU, dt);
 
-            // 限速
             double vmag = std::hypot(vx, vy);
             if (vmag > velMax) {
                 vx = vx / vmag * velMax;
                 vy = vy / vmag * velMax;
             }
 
-            if (loopCount % 20 == 0) {
-                // 精简日志: 仅 state 切换时打印, 减少阻塞
+            // 高度阶段转换
+            if (altPhase == DropPhase::TRACK_HIGH && vsState >= VisualServoState::TRACKING) {
+                altPhase = DropPhase::DESCEND;
+                vsState = VisualServoState::SEARCHING;
+                convergeCounter = 0;
+                holdCounter = 0;
+                log("[VSERVO_LOOP] Phase: TRACK -> DESCEND (aligned, descending to 1m)");
+            }
+            if (altPhase == DropPhase::DESCEND && alt < DROP_ALT_THRESHOLD) {
+                altPhase = DropPhase::JUDGE_1M;
+                vsState = VisualServoState::SEARCHING;
+                convergeCounter = 0;
+                holdCounter = 0;
+                log("[VSERVO_LOOP] Phase: DESCEND -> JUDGE_1M (reached 1m, judging drop)");
             }
 
-            // ── 投弹判定 ──
-            if (vsState == VisualServoState::READY_DROP && freshDetection &&
-                absErr < convergeTolPx && dropCount_ < 2) {
+            if (altPhase == DropPhase::JUDGE_1M && vsState == VisualServoState::READY_DROP &&
+                freshDetection && absErr < convergeTolPx && dropCount_ < 2) {
 
                 double velMag = std::hypot(
                     link_.nedVelocity().northM, link_.nedVelocity().eastM);
-                bool altOk = std::abs(alt - targetAlt) < ALT_TOLERANCE;
+                bool altOk = std::abs(alt - DROP_ALT) < ALT_TOLERANCE;
                 bool velOk = velMag < VEL_ZERO_TOL;
                 bool detectOk = detectRate >= DETECT_RATE_MIN;
 
                 if (altOk && velOk && detectOk) {
-                    // 决定使用哪个挂载点
-                    // 第1次: 选更近的；第2次: 优先选另一个
                     std::string dropSide;
                     if (dropCount_ == 0) {
-                        dropSide = side;   // 当前更近的挂载点
+                        dropSide = side;
                     } else {
-                        // 第2次投弹: 优先选没投过的那一侧
                         std::string prevSide = droppedSides_[0];
                         double dOther = (prevSide == "L") ? dR : dL;
                         if (dOther < convergeTolPx * 2) {
@@ -823,25 +954,31 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                         " detectRate=" + std::to_string((int)(detectRate*100)) + "%");
                     log("========================================");
 
-                    // 投弹后重置子状态, 继续搜索下一个目标
-                    vsState = VisualServoState::SEARCHING;
-                    convergeCounter = 0;
-                    holdCounter = 0;
-                    sideSelected = "";
-
                     if (dropCount_ >= 2) {
                         log("[VSERVO_LOOP] All 2 drops completed!");
-                        double altErr2 = alt - vsCfg.searchAlt;
+                        double altErr2 = alt - SEARCH_ALT;
                         double vz2 = vsCfg.altKp * altErr2;
                         vz2 = std::max(-vsCfg.altMaxVel, std::min(vsCfg.altMaxVel, vz2));
                         offboard_->setVelocityNed(0.0f, 0.0f,
                             static_cast<float>(vz2), initYaw_);
                         return 1;
                     }
+
+                    altPhase = DropPhase::CLIMB;
+                    lockedBucketId = 0;
+                    vsState = VisualServoState::SEARCHING;
+                    convergeCounter = 0;
+                    holdCounter = 0;
+                    sideSelected = "";
+                    noDetectFrames = 0;
+                    lostBriefFrames = 0;
+                    targetLost = false;
+                    targetLostBrief = false;
+                    searchMode = false;
+                    log("[VSERVO_LOOP] Phase: JUDGE_1M -> CLIMB (dropped, climbing to 3.5m)");
                 }
             }
         } else {
-            // ── 丢目标后的搜索模式 ──
             if (searchMode) {
                 double searchElapsed = duration<double>(now - searchStartTime).count();
                 if (searchElapsed > LOST_SEARCH_TIMEOUT) {
@@ -853,13 +990,21 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
                 vx = -LOST_SEARCH_SPEED * searchDirY;
                 vy =  LOST_SEARCH_SPEED * searchDirX;
             }
-
-            if (loopCount % 40 == 0) {
-                // 精简: 不再每帧打印搜索方向
-            }
         }
 
-        // 高度控制: alt(正=上), NED D(正=下) → vz = altKp×(alt−altRef)
+        if (altPhase == DropPhase::CLIMB && alt > SEARCH_ALT_THRESHOLD) {
+            altPhase = DropPhase::LOCK_HIGH;
+            vsState = VisualServoState::SEARCHING;
+            convergeCounter = 0;
+            holdCounter = 0;
+            noDetectFrames = 0;
+            lostBriefFrames = 0;
+            targetLost = false;
+            targetLostBrief = false;
+            searchMode = false;
+            log("[VSERVO_LOOP] Phase: CLIMB -> LOCK (reached 3.5m, searching next)");
+        }
+
         double altErr = alt - altRef;
         vz = vsCfg.altKp * altErr;
         vz = std::max(-vsCfg.altMaxVel, std::min(vsCfg.altMaxVel, vz));
@@ -878,19 +1023,17 @@ int missionStateMachine::runVisualServoLoop(double targetAlt, double totalTimeou
 // ── 侦察 → RTL → 降落 ─────────────────────────────────────
 
 void missionStateMachine::handleTransitToRecon() {
-    offboard_->stop();
-    sleep_for(milliseconds(500));
-
     float cruiseAlt = static_cast<float>(config_.flight.cruiseAlt);
     float rN = static_cast<float>(config_.reconZone.centerNorth);
     float rE = static_cast<float>(config_.reconZone.centerEast);
 
-    if (!offboard_->startPositionModeAt(rN, rE, -cruiseAlt, initYaw_)) {
+    if (!offboard_->isActive()) {
+        offboard_->startPositionModeAt(rN, rE, -cruiseAlt, initYaw_);
     }
 
     log("[RECON] Flying to recon zone at " + std::to_string(cruiseAlt) + "m");
     auto t0 = steady_clock::now();
-    double transitTime = 30.0;
+    double transitTime = 12.0;
     while (running_ && link_.isConnected() &&
            duration<double>(steady_clock::now() - t0).count() < transitTime) {
         offboard_->setPositionNed(rN, rE, -cruiseAlt, initYaw_);
@@ -951,13 +1094,13 @@ void missionStateMachine::handleReconScan() {
 void missionStateMachine::handleRtl() {
     offboard_->stop();
     sleep_for(milliseconds(500));
-    float rtlAlt = 5.0f;
+    float rtlAlt = 4.0f;
     log("Returning home at " + std::to_string(rtlAlt) + "m...");
 
     if (!offboard_->startPositionModeAt(0.0f, 0.0f, -rtlAlt, initYaw_)) {
     } else {
         auto t0 = steady_clock::now();
-        double rtlTime = 45.0;
+        double rtlTime = 25.0;
         while (running_ && link_.isConnected() &&
                duration<double>(steady_clock::now() - t0).count() < rtlTime) {
             offboard_->setPositionNed(0.0f, 0.0f, -rtlAlt, initYaw_);

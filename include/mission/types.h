@@ -48,23 +48,14 @@ struct servoConfig {
     int releaseDurationMs;
 };
 
-struct dualLoopConfig {
-    double posKp;
-    double posMaxVel;
-};
-
 struct flightConfig {
     double takeoffAlt;
     double cruiseAlt;
-    double dropAlt;
 };
 
 struct dropZoneConfig {
     double centerNorth;
     double centerEast;
-    int barrelCount;
-    double noDetectTimeout;
-    double scanOffset;
 };
 
 struct reconWaypoint {
@@ -80,21 +71,12 @@ struct reconZoneConfig {
 };
 
 struct visionConfig {
-    std::string pipePath;
     std::string cmdPipePath;
-    int imageWidth;
-    int imageHeight;
-    int targetClass;
 };
 
 struct connectionConfig {
     std::string url;
     double heartbeatTimeout;
-};
-
-struct projectPaths {
-    std::string configDir;
-    std::string analysisDir;
 };
 
 struct landingConfig {
@@ -109,7 +91,6 @@ struct visualServoConfig {
     double fineVelMax;
     double altKp;
     double altMaxVel;
-    double searchAlt;           // 丢目标搜索时保持的高度 (m, 正=上)
     int maxNoDetectFrames;
     int lostBriefFrames;
     int convergeFrames;
@@ -126,29 +107,15 @@ struct visualServoConfig {
     double convergeTolDefault;
 };
 
-struct pidTestConfig {
-    double testAlt;
-    double leftOffsetM;
-    double rightOffsetM;
-    double hoverBeforeSec;
-    double hoverAfterSec;
-    double convergeTolM;
-    double convergeHoldSec;
-    int timeoutSec;
-};
-
 struct missionConfigData {
     connectionConfig connection;
     flightConfig flight;
     dropZoneConfig dropZone;
     reconZoneConfig reconZone;
-    dualLoopConfig dualLoop;
     visualServoConfig visualServo;
     visionConfig vision;
     servoConfig servo;
     landingConfig landing;
-    pidTestConfig pidTest;
-    projectPaths paths;
     int missionPriority;
 };
 

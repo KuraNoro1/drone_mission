@@ -1,6 +1,16 @@
+# 舵机释放配置
+# ---------------------------------------------------------------------------
+# 通过 MAV_CMD_DO_SET_SERVO 控制两路 PWM 释放载荷
 servo:
+  # 舵机通道 (映射到飞控 AUX 输出)
   leftChannel: 11
   rightChannel: 12
+
+  # 释放 PWM 值 (1900 = 释放位置)
   releasePwm: 1900
+
+  # 保持 PWM 值 (1100 = 锁紧位置)
   holdPwm: 1100
+
+  # 释放持续时间 (ms), 到达后自动恢复到 holdPwm
   releaseDurationMs: 800

@@ -1,18 +1,16 @@
+# 投放区 & 侦察区 NED 坐标
 dropZone:
-  centerNorth: 30.0
-  centerEast: 0.0
-  barrelCount: 3
-  noDetectTimeout: 8.0
-  scanOffset: 2.5
-  priority: 0   # 0=优先大桶(桶3=25cm), 1=优先小桶(桶1=15cm)
+  centerNorth: 30.0      # 投放区中心 NED North (m)
+  centerEast: 0.0        # 投放区中心 NED East (m)
+  priority: 0            # 0=优先大桶(25cm), 1=优先小桶(15cm)
 
 reconZone:
-  centerNorth: 60.0
-  centerEast: 0.0
-  hoverTime: 3.0
-  waypoints:
-    - { north: 58.0, east: -3.0 }
-    - { north: 58.5, east:  3.0 }
-    - { north: 59.5, east: -3.0 }
-    - { north: 60.5, east:  3.0 }
-    - { north: 61.5, east: -3.0 }
+  centerNorth: 55.0      # 侦察区中心 NED North (m)
+  centerEast: 0.0        # 侦察区中心 NED East (m)
+  hoverTime: 3.0         # 每航点悬停时间 (s)
+  waypoints:             # 中心 → 四角 ±1.5m(E)×±2.5m(N)
+    - { north: 55.0, east:  0.0 }
+    - { north: 53.0, east:  1.5 }
+    - { north: 57.0, east:  1.5 }
+    - { north: 57.0, east: -1.5 }
+    - { north: 53.0, east: -1.5 }

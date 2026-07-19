@@ -1,6 +1,6 @@
 #pragma once
-#include "droneLink.h"
-#include "dualLoopPid.h"
+#include "comm/droneLink.h"
+#include "control/dualLoopPid.h"
 #include <memory>
 
 class offboardControl {

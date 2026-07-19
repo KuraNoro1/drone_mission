@@ -1,4 +1,5 @@
+# 飞行高度 + 降落配置
 flight:
-  takeoffAlt: 3.0
-  cruiseAlt: 5.0
-  dropAlt: 1.6
+  takeoffAlt: 3.0        # 起飞高度 (m, ARM→TAKEOFF)
+  cruiseAlt: 4.5         # 巡航/侦察高度 (m, RECON_SCAN)
+  rtlTimeout: 120        # 降落超时 (s, handleRtl landing timeout)

@@ -2,9 +2,9 @@
 #include <csignal>
 #include <string>
 #include <iomanip>
-#include "droneLink.h"
-#include "missionConfig.h"
-#include "missionStateMachine.h"
+#include "comm/droneLink.h"
+#include "mission/missionConfig.h"
+#include "mission/missionStateMachine.h"
 
 using namespace std::chrono;
 

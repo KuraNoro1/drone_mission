@@ -7,7 +7,7 @@
 #include <memory>
 #include <string>
 #include <atomic>
-#include "types.h"
+#include "mission/types.h"
 
 class droneLink {
 public:

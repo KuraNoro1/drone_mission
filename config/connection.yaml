@@ -1,6 +1,11 @@
+# MAVSDK 飞控连接配置
+# ---------------------------------------------------------------------------
 connection:
-  #真实飞行
-  #url: "serial:///dev/ttyTHS1:57600"
-  #仿真启动
-  url: "udp://:14550" 
+  # --- 串口连接 (真机 Jetson Nano + TELEM2) ---
+  # url: "serial:///dev/ttyTHS1:57600"
+
+  # --- UDP 连接 (SITL 仿真) ---
+  url: "udp://:14550"
+
+  # 心跳超时 (秒), 超过此时间未收到心跳则判定失联
   heartbeatTimeout: 10.0

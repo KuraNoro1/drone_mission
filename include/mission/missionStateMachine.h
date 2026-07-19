@@ -3,14 +3,15 @@
 #include <fstream>
 #include <vector>
 #include <chrono>
-#include "types.h"
-#include "droneLink.h"
-#include "flightOps.h"
-#include "offboardControl.h"
-#include "servoControl.h"
-#include "pidController.h"
-#include "visionInterface.h"
-#include "missionConfig.h"
+#include "mission/types.h"
+#include "comm/droneLink.h"
+#include "comm/flightOps.h"
+#include "comm/offboardControl.h"
+#include "comm/servoControl.h"
+#include "control/pidController.h"
+#include "vision/visionInterface.h"
+#include "mission/missionConfig.h"
+#include "bomb/bombDropSystem.h"
 
 enum class VisualServoState {
     SEARCHING,
@@ -79,6 +80,8 @@ private:
     std::unique_ptr<pidController> pidN_;
     std::unique_ptr<pidController> pidE_;
 
+    std::unique_ptr<BombDropSystem> bombSystem_;
+
     int reconWpIndex_;
     int dropSearchPhase_;
     bool bucketFound_;
@@ -89,4 +92,8 @@ private:
     int dropCount_;
     std::vector<std::string> droppedSides_;
     std::chrono::steady_clock::time_point dropZoneEnterTime_;
+
+    int stableDetectCount_;
+    int lastDetectTargetId_;
+    std::chrono::steady_clock::time_point searchCooldownStart_;
 };

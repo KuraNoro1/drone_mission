@@ -11,42 +11,48 @@ pkg_check_modules(MAVSDK_PKG REQUIRED mavsdk)
 find_package(yaml-cpp REQUIRED)
 
 set(SOURCE_FILES
-    src/main.cpp
-    src/droneLink.cpp
-    src/flightOps.cpp
-    src/offboardControl.cpp
-    src/servoControl.cpp
-    src/pidController.cpp
-    src/dualLoopPid.cpp
-    src/visionInterface.cpp
-    src/missionConfig.cpp
-    src/missionStateMachine.cpp
+    src/mission/main.cpp
+    src/comm/droneLink.cpp
+    src/comm/flightOps.cpp
+    src/comm/offboardControl.cpp
+    src/comm/servoControl.cpp
+    src/control/pidController.cpp
+    src/control/dualLoopPid.cpp
+    src/vision/visionInterface.cpp
+    src/mission/missionConfig.cpp
+    src/mission/missionStateMachine.cpp
+    src/bomb/coordinateMapper.cpp
+    src/bomb/kalmanFilter.cpp
+    src/bomb/targetTracker.cpp
+    src/bomb/bombDropSystem.cpp
 )
 
 set(HEADER_FILES
-    include/types.h
-    include/droneLink.h
-    include/flightOps.h
-    include/offboardControl.h
-    include/servoControl.h
-    include/pidController.h
-    include/dualLoopPid.h
-    include/visionInterface.h
-    include/missionConfig.h
-    include/missionStateMachine.h
-)
-
-set(TEST_SOURCES
-    src/test_flight.cpp
-    src/droneLink.cpp
-    src/flightOps.cpp
-    src/missionConfig.cpp
+    include/mission/types.h
+    include/comm/droneLink.h
+    include/comm/flightOps.h
+    include/comm/offboardControl.h
+    include/comm/servoControl.h
+    include/control/pidController.h
+    include/control/dualLoopPid.h
+    include/vision/visionInterface.h
+    include/mission/missionConfig.h
+    include/mission/missionStateMachine.h
+    include/bomb/coordinateMapper.h
+    include/bomb/kalmanFilter.h
+    include/bomb/targetTracker.h
+    include/bomb/bombDropSystem.h
 )
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES} ${HEADER_FILES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/include/mission
+    ${PROJECT_SOURCE_DIR}/include/comm
+    ${PROJECT_SOURCE_DIR}/include/control
+    ${PROJECT_SOURCE_DIR}/include/vision
+    ${PROJECT_SOURCE_DIR}/include/bomb
     ${MAVSDK_PKG_INCLUDE_DIRS}
 )
 
@@ -57,25 +63,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
-    ${MAVSDK_PKG_CFLAGS}
-    ${MAVSDK_PKG_CFLAGS_OTHER}
-    -Wall -O2
-)
-
-add_executable(testFlight ${TEST_SOURCES})
-
-target_include_directories(testFlight PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${MAVSDK_PKG_INCLUDE_DIRS}
-)
-
-target_link_libraries(testFlight PRIVATE
-    yaml-cpp::yaml-cpp
-    ${MAVSDK_PKG_LIBRARIES}
-    pthread
-)
-
-target_compile_options(testFlight PRIVATE
     ${MAVSDK_PKG_CFLAGS}
     ${MAVSDK_PKG_CFLAGS_OTHER}
     -Wall -O2
