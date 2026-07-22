@@ -1,0 +1,3 @@
+# 视觉管道配置
+vision:
+  cmdPipePath: "/tmp/mission_cmd"   # FIFO管道, C++→Python 状态同步

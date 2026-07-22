@@ -1,0 +1,36 @@
+# 视觉伺服 PID 参数
+visualServo:
+  # PID 增益
+  kp: 0.98               # P: 归一化像素误差→速度 (m/s)
+  ki: 0.92              # I: 消除安装偏差累积
+  kd: 0.01               # D: =0 (YOLO框抖动放大噪声)
+
+  # 速度限幅
+  maxVelXY: 0.5          # 水平最大速度 (m/s)
+  fineVelMax: 0.2        # 对准阶段水平最大速度 (m/s)
+  altKp: 0.8             # 高度 P 增益
+  altMaxVel: 0.5         # 高度最大速度 (m/s)
+
+  # 丢目标判定
+  maxNoDetectFrames: 40  # 连续丢帧阈值 (×50ms=2.0s)
+  lostBriefFrames: 20    # 短暂丢帧容忍
+
+  # 状态转换
+  convergeFrames: 10     # TRACKING→CONVERGED 需连续对准帧数
+  holdFrames: 30         # CONVERGED→READY_DROP 需稳定帧数
+
+  # 投弹条件 (legacy, BombDropSystem 使用硬编码参数)
+  altTolerance: 0.1      # 高度容差 (m)
+  velZeroTol: 0.15       # 静止速度阈值 (m/s)
+  detectRateMin: 0.4     # 最低检测率
+  detectWindow: 60       # 检测率滑动窗口
+
+  # 丢桶搜索 (legacy)
+  lostSearchSpeed: 0.5   # 搜索速度 (m/s)
+  lostSearchTimeout: 3.0 # 搜索超时 (s)
+
+  # 按桶尺寸的收敛像素容差
+  convergeTol15cm: 45
+  convergeTol20cm: 35
+  convergeTol25cm: 25
+  convergeTolDefault: 30
