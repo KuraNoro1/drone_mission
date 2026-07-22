@@ -14,11 +14,13 @@
 第三步: src/bomb/coordinateMapper.cpp    数学实现
 第四步: include/bomb/kalmanFilter.h      Kalman 接口
 第五步: include/bomb/targetTracker.h    目标跟踪接口
-第六步: src/bomb/targetTracker.cpp      状态机实现
+第六步: src/bomb/targetTracker.cpp      状态机实现 (空间匹配 + commit)
 第七步: include/bomb/bombDropSystem.h   投放系统接口
-第八步: src/bomb/bombDropSystem.cpp     核心投放逻辑
+第八步: src/bomb/bombDropSystem.cpp     核心投放逻辑 (7 阶段状态机)
 第九步: include/mission/missionStateMachine.h  顶层接口
-第十步: src/mission/missionStateMachine.cpp    任务流控
+第十步: src/mission/missionStateMachine.cpp    任务流控 (H 着舰)
+第十一步: include/vision/visionInterface.h     管道接口
+第十二步: src/vision/visionInterface.cpp       管道实现 (5 管道)
 ```
 
 ---
@@ -76,62 +78,78 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 **关键函数**: `scanForTargets()`
 
 ```cpp
-// 聚类核心逻辑:
+// 聚类核心逻辑 (当前实现):
 // 1. 每个检测分配最近簇 (距离<50px)
 // 2. 无匹配 → 新建簇 (最多10个)
-// 3. 簇中心 = 均值
+// 3. 簇中心 = 本帧分配检测的均值
 // 4. 稳定帧计数器: 中心变化<50px → +1, 否则=1
 // 5. bucketId 投票取众数
 // 6. 稳定≥3帧 → 映射世界坐标
-// 7. 世界坐标去重: 0.5m内视为同一目标
-// 8. 边界检查: 相对于扫描位置 ±20m
+// 7. 世界坐标去重: 0.5m 内视为同一目标
+// 8. 边界检查: 相对于扫描原点 ±20m
+// 9. 扫描结束按评分 (尺寸 × 优先级权重) 排序
 
 // 潜在问题:
 // - 50px 阈值在 3.5m 高度约对应 0.3m 世界距离 — 合理
-// - 聚类未考虑桶尺寸差异 — 15cm和25cm桶在3.5m高像素差异约 19px
+// - 聚类未考虑桶尺寸差异 — 15cm 和 25cm 桶在 3.5m 高像素差异约 19px
 ```
 
 **关键函数**: `trackAndDescend()`
 
 ```cpp
-// 控制分流:
-if (VISIBLE/LOST_SHORT) {
+// 5 控制分支:
+if (VISIBLE || LOST_SHORT) {
     if (committed) → World PID
     else → Pixel PID
-} else if (committed) {
-    → 弱世界坐标修正 (k=0.15)
-} else if (!committed) {
+}
+else if (LOST_LONG || REACQUIRE early) {
+    if (!committed) → vx=vy=0 (悬停), vz=0 (暂停下降)
+}
+else if (committed) {
+    → 弱世界坐标修正 (k=0.15), 继续下降
+}
+else {
     → 进入 REACQUIRE
 }
 
-// 高度控制:
-if (!committed && !VISIBLE) → vz=0 (暂停下降)
-else → vz = kpZ * (alt - dropAlt) (继续下降)
+// 安全高度:
+if (alt < minSafeAlt (0.6m)) → vz = MAX_DESCENT_RATE (0.3 m/s) 强制上升
+// 减速区:
+if (alt < dropAlt + decelZone (0.6m)) → 线性降速至 dropAlt 处速度=0
 
-// 审查要点:
-// 1. PID 是否在合适时机 reset
-// 2. committed 后丢失是否继续下降
-// 3. REACQUIRE 冷却和次数上限
+// REACQUIRE 子状态:
+HOVER (1s) → SPIRAL (6s, 0.2→1.0m 扩展半径) → CLIMB (4s, 升 upTo1.5m)
+退出后 1s 冷却, 最多 5 次重试 per target
 ```
 
 **关键函数**: `predictAndDrop()`
 
 ```cpp
-// 投弹五条件:
-cond1 = pixelErr < 20px || committed
-cond2 = 水平速度 < velZeroTol (0.05m/s)
-cond3 = |alt - 1.0m| < altTolerance
-cond4 = 稳定 > 0.5s
-cond5 = true (无置信度判断)
+// 简化的投弹判断 (vs 早期五条件):
+// committed → 世界坐标弱修正, 等待 pixelErr < convergeTolPx → DROP
+// 未commit → 视觉 PID, 等待 pixelErr < convergeTolPx → DROP
+// 超时: 15s
 
-// 落点预测:
+// 落点预测 (仅日志):
 tFall = sqrt(2 * alt / 9.81)
-impact = vel * tFall  // 仅日志输出, 未用于决策
+impact = vel * tFall
+```
 
-// 审查要点:
-// 1. committed后 cond1 自动通过 — 符合设计
-// 2. 稳定时间检查: stableStart 是否正确重置
-// 3. side 选择逻辑: 第一弹选近侧, 第二弹选另一侧
+### `scripts/detector_unified.py`
+
+```cpp
+// 状态机:
+DROP_SEARCH/DROP_VISUAL_SERVO/TRANSIT_TO_DROP → DROP 模式 (YOLO 桶检测)
+RECON_SCAN → RECON 模式 (YOLO + HSV 颜色分析)
+RTL → H_LAND 模式 (YOLO H 检测)
+OTHER → IDLE (仅过帧)
+
+// GPU 内存:
+maybe_unload_bucket_model() / maybe_unload_h_model() 动态切换
+
+// 图像存档:
+后台线程, 每 5 帧存 1 帧 → TestImgs/data_YYYYMMDD_N/
+文件名格式: {MODE}_{HHMMSS}_{microseconds}.jpg
 ```
 
 ### `src/mission/missionStateMachine.cpp`
@@ -140,17 +158,37 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 
 ```cpp
 // 流控:
-1. 位置模式悬停 3.5m
-2. 28m 距离滤波
+1. 位置模式悬停 searchAlt (3.5m)
+2. 28m 距离滤波 (起飞点周围 28m 内忽略检测)
 3. 90s 超时检查
-4. bombSystem_->execute()
-5. 结果处理: 稳定爬升 + 强制投弹补齐
-6. → transitToRecon
+4. bombSystem_->execute(remaining, initYaw_)   // 委派给投放子系统
+5. 结果处理: 5s 稳定爬升 + forceDropAll 补齐 → transitToRecon
 
 // 审查要点:
-// 1. bombSystem 超时后是否正确处理
-// 2. 稳定爬升 5s 是否足够
-// 3. 强制投弹顺序是否正确 (Left then Right)
+// 1. bombSystem 超时后是否正确返回 timedOut
+// 2. 稳定爬升 5s 是否足够恢复姿态
+// 3. forceDropAll 顺序: Left → Right (串行)
+```
+
+**关键函数**: `handleRtl()`
+
+```cpp
+// H-guided 着舰:
+1. 返航巡航 25s 保持 4m
+2. 切换到 position 模式
+3. 预读 H 检测 (可能有巡航阶段积累的结果)
+4. 两阶段下降:
+   - alt > 4m: vz = 0.3 m/s (快速)
+   - alt < 4m: above 0.4m → 0.3 m/s, below 0.4m → 0.15 m/s (慢速)
+5. H 丢失处理:
+   - committed (世界坐标可用) → 继续用上次世界坐标下降
+   - 未commit → 暂停, 等待 (30s 超时 → fallback MAVSDK land)
+6. alt < 0.2m → FALLTHROUGH → MAVSDK land()
+
+// 审查要点:
+// 1. committed 条件 (连续稳定帧 + 高度阈值)
+// 2. 两阶段速度切换边界是否正确
+// 3. FALLTHROUGH 时机和 fallback 超时
 ```
 
 **关键函数**: `handleTransitToRecon()`
@@ -173,13 +211,15 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 | 循环位置 | 超时机制 | 超时值 |
 |----------|----------|--------|
 | `trackAndDescend()` | `TRACKING_TIMEOUT` | 60s |
-| `predictAndDrop()` | 无显式超时 (靠外层 90s) | implicit |
+| `predictAndDrop()` | PREDICT 阶段循环 | 15s |
 | `scanForTargets()` | `timeoutSec` 参数 | 8s / 5s |
 | `gotoWorldTarget()` | `gotoTimeout` | 10s |
-| `visualAlignBriefly()` | `BRIEF_TIMEOUT` | 3s |
+| `climbToSearchAlt()` | CLIMB 阶段循环 | 10s |
 | REACQUIRE HOVER | `raElapsed > 1.0` | 1s |
 | REACQUIRE SPIRAL | `raElapsed > 6.0` | 6s |
 | REACQUIRE CLIMB | `raElapsed > 4.0` | 4s |
+| H 着舰等待 | `hLandTimeout` | 30s |
+| DROP_SEARCH 全局 | 外层 90s | 90s |
 
 ### 3.2 Offboard 模式切换真空期
 
@@ -209,15 +249,18 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 [BOMB] GOTO: (N,E) at Hm    → 导航目标
 [BOMB] TRACKING: ...        → 跟踪开始
 [BOMB] REACQUIRE #N: ...    → 进入恢复 (检查次数和触发原因)
-[BOMB] TARGET COMMITTED     → commit 成功 (检查高度)
+[BOMB] TARGET COMMITTED     → commit 成功 (检查高度和误差)
 [BOMB] >>>>> DROP ...       → 投弹 (检查 err/vel/alt/commit)
 [BOMB] CLIMB: to Hm         → 爬升
 [DROP] BombDropSystem finished: drops=X/2 → 投放结束
-[DROP] Stabilizing...        → 稳定爬升
+[DROP] Stabilizing...       → 稳定爬升
 STATE: DROP_SEARCH -> TRANSIT_TO_RECON → 侦察开始
+[RTL] H detected: (cx,cy)   → H 着舰检测
+STATE: RTL -> LANDED        → 着舰完成
 ```
 
 **异常模式识别**:
 - `REACQUIRE #1..#5` 频繁出现 → commit 太晚或视觉不稳定
 - `commit=no` in DROP → commit 条件未满足 (正常，视觉满足即可)
-- `err=0.00px` in DROP → 可能 YOLO 无检测时误判, 检查 `hasVis` 逻辑
+- `err=0.00px` in DROP → 可能检测丢失时误判, 检查 `hasVis` 逻辑
+- H 着舰超时 fallback → H 模型未加载或 H 标识不在视野
