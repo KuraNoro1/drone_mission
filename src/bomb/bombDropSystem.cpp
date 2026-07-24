@@ -86,7 +86,17 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                 log("Phase: SCAN at " + std::to_string(cfg_.searchAlt) +
                     "m origin=(" + std::to_string(scanOriginN_).substr(0,5) + "," +
                     std::to_string(scanOriginE_).substr(0,5) + ")");
-                if (!scanForTargets(8.0)) { result.timedOut = true; return result; }
+                const int MAX_SCAN_TRIES = 3;
+                bool scanOk = false;
+                for (int t = 1; t <= MAX_SCAN_TRIES; ++t) {
+                    log("SCAN: attempt " + std::to_string(t) + "/" + std::to_string(MAX_SCAN_TRIES));
+                    if (scanForTargets(8.0)) { scanOk = true; break; }
+                    if (t < MAX_SCAN_TRIES) {
+                        log("SCAN: empty, retrying...");
+                        sleep_for(milliseconds(500));
+                    }
+                }
+                if (!scanOk) { result.timedOut = true; return result; }
                 phase_ = Phase::SELECT;
                 break;
             }
@@ -184,6 +194,9 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
     log("Scanning for buckets...");
 
+    auto lastNonEmpty = steady_clock::now();
+    const double CLUSTER_EXPIRE_SEC = 2.0;
+
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
         offboard_.setPositionNed(
@@ -192,8 +205,14 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
         multiBucketData vis;
         if (!bucketPipe_.readLatest(vis) || vis.empty()) {
-            clusters.clear(); sleep_for(milliseconds(100)); continue;
+            double idleSec = duration<double>(steady_clock::now() - lastNonEmpty).count();
+            if (idleSec > CLUSTER_EXPIRE_SEC) {
+                clusters.clear();
+                lastNonEmpty = steady_clock::now();
+            }
+            sleep_for(milliseconds(100)); continue;
         }
+        lastNonEmpty = steady_clock::now();
 
         // 当前帧: 每个检测分配到最近簇
         std::set<int> matchedIds;
@@ -766,9 +785,8 @@ bool BombDropSystem::predictAndDrop() {
 bool BombDropSystem::climbToSearchAlt() {
     log("CLIMB: to " + std::to_string(cfg_.searchAlt) + "m");
     tracker_->unlock();
-    offboard_.stop();
     auto ned = link_.nedPosition();
-    if (!offboard_.startPositionModeAt(
+    if (!offboard_.switchToPositionMode(
             static_cast<float>(ned.northM), static_cast<float>(ned.eastM),
             static_cast<float>(-cfg_.searchAlt), initYaw_)) return false;
 

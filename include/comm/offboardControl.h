@@ -10,6 +10,7 @@ public:
     bool startPositionMode();
     bool startPositionModeAt(float north, float east, float down, float yaw);
     bool startVelocityMode();
+    bool switchToPositionMode(float north, float east, float down, float yaw);
     bool stop();
 
     void setPositionNed(float north, float east, float down, float yaw);

@@ -71,7 +71,7 @@ bool offboardControl::startPositionModeAt(float north, float east,
 bool offboardControl::startVelocityMode() {
     if (active_ && positionMode_) {
         stop();
-        sleep_for(milliseconds(500));
+        sleep_for(milliseconds(100));
     }
     if (active_) return true;
 
@@ -88,6 +88,33 @@ bool offboardControl::startVelocityMode() {
     active_ = true;
     positionMode_ = false;
     log("Offboard mode active (velocity)");
+    return true;
+}
+
+bool offboardControl::switchToPositionMode(float north, float east,
+                                            float down, float yaw) {
+    if (active_ && !positionMode_) {
+        setVelocityNed(0, 0, 0, yaw);
+        sleep_for(milliseconds(50));
+
+        stop();
+
+        setPositionNed(north, east, down, yaw);
+        auto result = link_.offboard().start();
+        if (result != Offboard::Result::Success) {
+            log("ERROR: Offboard switch to position failed");
+            return false;
+        }
+
+        active_ = true;
+        positionMode_ = true;
+        log("Offboard mode active (position)");
+        return true;
+    }
+
+    if (!active_)
+        return startPositionModeAt(north, east, down, yaw);
+
     return true;
 }
 

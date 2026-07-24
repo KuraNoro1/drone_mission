@@ -403,10 +403,7 @@ void missionStateMachine::handleDropSearch() {
 
     BombDropResult result = bombSystem_->execute(remaining, initYaw_);
 
-    // 稳定爬升: 投弹后从~1m爬到searchAlt, 避免真空期坠毁
-    offboard_->stop();
-    sleep_for(milliseconds(300));
-    offboard_->startPositionModeAt(dropTargetN_, dropTargetE_, -searchAlt, initYaw_);
+    offboard_->switchToPositionMode(dropTargetN_, dropTargetE_, -searchAlt, initYaw_);
     log("[DROP] Stabilizing at " + std::to_string(searchAlt) + "m before recon...");
 
     auto stabilizeT0 = steady_clock::now();
@@ -427,15 +424,7 @@ void missionStateMachine::handleDropSearch() {
 
     if (dropCount_ < 2) {
         log("[DROP] Incomplete drops, forcing remaining");
-        while (dropCount_ < 2) {
-            int ch = (dropCount_ == 0) ? config_.servo.leftChannel
-                                       : config_.servo.rightChannel;
-            servo_->setPwm(ch, config_.servo.releasePwm);
-            sleep_for(milliseconds(static_cast<int>(config_.servo.releaseDurationMs)));
-            servo_->setPwm(ch, config_.servo.holdPwm);
-            dropCount_++;
-            sleep_for(milliseconds(300));
-        }
+        forceDropAll();
     }
 
     setState(missionState::transitToRecon);
@@ -463,11 +452,31 @@ bool missionStateMachine::checkDropZoneTimeout() {
 }
 
 void missionStateMachine::forceDropAll() {
+    float dropAlt = static_cast<float>(config_.flight.dropAlt);
+    log("[FORCE_DROP] Descending to drop alt " + std::to_string(dropAlt) + "m first");
+
+    auto ned = link_.nedPosition();
+    if (!offboard_->isActive())
+        offboard_->startPositionModeAt(
+            static_cast<float>(ned.northM), static_cast<float>(ned.eastM), -dropAlt, initYaw_);
+    else
+        offboard_->switchToPositionMode(
+            static_cast<float>(ned.northM), static_cast<float>(ned.eastM), -dropAlt, initYaw_);
+
+    auto tDescend = steady_clock::now();
+    while (duration<double>(steady_clock::now() - tDescend).count() < 8.0) {
+        offboard_->setPositionNed(
+            static_cast<float>(ned.northM), static_cast<float>(ned.eastM), -dropAlt, initYaw_);
+        if (link_.altitude() < dropAlt + 0.3) break;
+        sleep_for(milliseconds(200));
+    }
+
     while (dropCount_ < 2) {
         int ch = (dropCount_ == 0) ? config_.servo.leftChannel
                                    : config_.servo.rightChannel;
         const char* side = (dropCount_ == 0) ? "Left" : "Right";
-        log("[FORCE_DROP] Releasing " + std::string(side));
+        log("[FORCE_DROP] Releasing " + std::string(side) +
+            " at alt=" + std::to_string(link_.altitude()).substr(0,4) + "m");
 
         servo_->setPwm(ch, config_.servo.releasePwm);
         sleep_for(milliseconds(config_.servo.releaseDurationMs));
