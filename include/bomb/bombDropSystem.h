@@ -53,7 +53,7 @@ private:
     enum class Phase { SCAN, SELECT, GOTO, TRACKING, PREDICT, CLIMB, DONE };
 
     // ── 扫描 ──
-    bool scanForTargets(double timeoutSec);
+    bool scanForTargets(double timeoutSec);   // 高度使用 cfg_.searchAlt
     bool selectNextTarget();
 
     // ── 导航到目标世界坐标 ──
@@ -70,6 +70,9 @@ private:
 
     void releasePayload(const std::string& side);
     DroneState getDroneState() const;
+
+    // ── 飞回扫描原点 ──
+    bool flyToScanOrigin();
 
     droneLink& link_;
     offboardControl& offboard_;
@@ -99,4 +102,8 @@ private:
     std::unique_ptr<pidController> pidY_;
 
     std::chrono::steady_clock::time_point loopStart_;
+
+    // 扫描原点 (第一次 SCAN 时记录)
+    double scanOriginN_;
+    double scanOriginE_;
 };

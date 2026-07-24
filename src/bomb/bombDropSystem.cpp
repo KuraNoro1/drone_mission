@@ -29,7 +29,8 @@ namespace {
 BombDropSystem::BombDropSystem(droneLink& link, offboardControl& offboard,
                                servoControl& servo, multiBucketPipe& bucketPipe)
     : link_(link), offboard_(offboard), servo_(servo), bucketPipe_(bucketPipe),
-      priority_(0), phase_(Phase::SCAN), dropCount_(0), initYaw_(0), currentTargetIdx_(-1) {}
+      priority_(0), phase_(Phase::SCAN), dropCount_(0), initYaw_(0), currentTargetIdx_(-1),
+      scanOriginN_(0), scanOriginE_(0) {}
 
 void BombDropSystem::configure(const DropConfig& cfg, const CameraIntrinsics& intrinsics,
                                const CameraExtrinsics& extrinsics, int priority) {
@@ -39,6 +40,7 @@ void BombDropSystem::configure(const DropConfig& cfg, const CameraIntrinsics& in
 void BombDropSystem::reset() {
     phase_ = Phase::SCAN; dropCount_ = 0; droppedSides_.clear();
     targetMap_.clear(); currentTargetIdx_ = -1;
+    scanOriginN_ = 0; scanOriginE_ = 0;
 }
 
 DroneState BombDropSystem::getDroneState() const {
@@ -46,6 +48,45 @@ DroneState BombDropSystem::getDroneState() const {
     auto vel = link_.nedVelocity();
     return {ned.northM, ned.eastM, link_.altitude(), static_cast<double>(initYaw_),
             vel.northM, vel.eastM};
+}
+
+// ── 辅助：飞回扫描原点 ──
+bool BombDropSystem::flyToScanOrigin() {
+    if (scanOriginN_ == 0 && scanOriginE_ == 0) {
+        log("Scan origin not recorded, staying at current position");
+        return true;
+    }
+    log("Flying to scan origin (" + std::to_string(scanOriginN_).substr(0,5) + "," +
+        std::to_string(scanOriginE_).substr(0,5) + ") at " +
+        std::to_string(cfg_.searchAlt) + "m");
+
+    offboard_.stop();
+    sleep_for(milliseconds(300));
+    if (!offboard_.startPositionModeAt(static_cast<float>(scanOriginN_),
+                                       static_cast<float>(scanOriginE_),
+                                       static_cast<float>(-cfg_.searchAlt),
+                                       initYaw_)) {
+        log("Failed to start position mode to origin");
+        return false;
+    }
+
+    auto t0 = steady_clock::now();
+    const double TIMEOUT = 10.0;
+    while (duration<double>(steady_clock::now() - t0).count() < TIMEOUT) {
+        offboard_.setPositionNed(static_cast<float>(scanOriginN_),
+                                 static_cast<float>(scanOriginE_),
+                                 static_cast<float>(-cfg_.searchAlt),
+                                 initYaw_);
+        auto ned = link_.nedPosition();
+        double dist = std::hypot(ned.northM - scanOriginN_, ned.eastM - scanOriginE_);
+        if (dist < 0.5) {
+            log("Arrived at scan origin");
+            return true;
+        }
+        sleep_for(milliseconds(200));
+    }
+    log("Timeout flying to scan origin");
+    return false;
 }
 
 // ── 主执行 ─────────────────────────────────────────────────
@@ -79,21 +120,71 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
         if (!link_.isConnected()) { result.timedOut = true; break; }
 
         switch (phase_) {
-            case Phase::SCAN:
-                log("Phase: SCAN at " + std::to_string(cfg_.searchAlt) + "m");
+            case Phase::SCAN: {
+                // 记录扫描原点
+                auto ned = link_.nedPosition();
+                scanOriginN_ = ned.northM;
+                scanOriginE_ = ned.eastM;
+                log("Phase: SCAN at " + std::to_string(cfg_.searchAlt) +
+                    "m origin=(" + std::to_string(scanOriginN_).substr(0,5) + "," +
+                    std::to_string(scanOriginE_).substr(0,5) + ")");
                 if (!scanForTargets(8.0)) { result.timedOut = true; return result; }
                 phase_ = Phase::SELECT;
                 break;
+            }
             case Phase::SELECT:
                 if (!selectNextTarget()) {
                     log("All mapped targets exhausted, re-scanning...");
-                    if (!scanForTargets(5.0)) {
-                        log("Re-scan found nothing, abort");
-                        result.timedOut = true; return result;
+                    // 飞回扫描原点（3.5m）
+                    if (!flyToScanOrigin()) {
+                        log("Failed to return to scan origin, abort");
+                        result.timedOut = true;
+                        return result;
                     }
+                    // 临时将搜索高度改为 4.0m (第一次高度 +0.5m)
+                    double originalSearchAlt = cfg_.searchAlt;
+                    double newSearchAlt = originalSearchAlt + 0.5;
+                    cfg_.searchAlt = newSearchAlt;
+                    log("Temporary re-scan height set to " + std::to_string(newSearchAlt) + "m");
+
+                    // 爬升至新高度（当前位置已位于原点，但高度为 originalSearchAlt）
+                    auto ned = link_.nedPosition();
+                    offboard_.stop(); sleep_for(milliseconds(300));
+                    if (!offboard_.startPositionModeAt(static_cast<float>(ned.northM),
+                                                       static_cast<float>(ned.eastM),
+                                                       static_cast<float>(-newSearchAlt),
+                                                       initYaw_)) {
+                        log("Failed to climb for re-scan");
+                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        result.timedOut = true;
+                        return result;
+                    }
+                    // 等待到达目标高度
+                    auto tClimb = steady_clock::now();
+                    while (duration<double>(steady_clock::now() - tClimb).count() < 10.0) {
+                        offboard_.setPositionNed(static_cast<float>(ned.northM),
+                                                 static_cast<float>(ned.eastM),
+                                                 static_cast<float>(-newSearchAlt),
+                                                 initYaw_);
+                        double alt = link_.altitude();
+                        if (std::abs(alt - newSearchAlt) < 0.3) break;
+                        sleep_for(milliseconds(200));
+                    }
+
+                    // 二次扫描 8 秒 (内部使用 cfg_.searchAlt，现已临时改为 newSearchAlt)
+                    if (!scanForTargets(8.0)) {
+                        log("Re-scan found nothing, abort");
+                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        result.timedOut = true;
+                        return result;
+                    }
+                    // 恢复原搜索高度
+                    cfg_.searchAlt = originalSearchAlt;
+
                     if (!selectNextTarget()) {
                         log("Re-scan still no targets");
-                        result.timedOut = true; return result;
+                        result.timedOut = true;
+                        return result;
                     }
                 }
                 phase_ = Phase::GOTO;
@@ -151,7 +242,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             static_cast<float>(-cfg_.searchAlt), initYaw_);
     }
 
-    log("Scanning for buckets...");
+    log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m...");
 
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
@@ -622,4 +713,5 @@ void BombDropSystem::releasePayload(const std::string& side) {
     servo_.setPwm(ch, cfg_.holdPwm);
     droppedSides_.push_back(side);
     dropCount_++;
+    log("releasePayload: dropCount_ = " + std::to_string(dropCount_));
 }

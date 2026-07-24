@@ -6,8 +6,8 @@ servo:
   leftChannel: 11
   rightChannel: 12
 
-  # 释放 PWM 值 (1900 = 释放位置)
-  releasePwm: 1900
+  # 释放 PWM 值 (2000 = 释放位置)
+  releasePwm: 2000
 
   # 保持 PWM 值 (1100 = 锁紧位置)
   holdPwm: 1100
