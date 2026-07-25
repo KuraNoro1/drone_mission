@@ -69,7 +69,7 @@ bool missionStateMachine::init() {
         dropCfg.approachAlt     = 1.4;          // 接近目标高度
         dropCfg.dropAlt         = config_.flight.dropAlt;   // 从配置读取
         dropCfg.gotoTimeout     = 10.0;
-        dropCfg.stableDuration  = 0.5;
+        dropCfg.stableDuration  = 0.3;
         dropCfg.velZeroTol      = vsCfg.velZeroTol;
         dropCfg.altTolerance    = vsCfg.altTolerance;
         dropCfg.releaseDurationMs = static_cast<double>(config_.servo.releaseDurationMs);

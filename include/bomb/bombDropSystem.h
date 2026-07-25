@@ -74,6 +74,8 @@ private:
     // ── 飞回扫描原点 ──
     bool flyToScanOrigin();
 
+    bool lastHasPix_;   // 记录上一帧是否有像素，用于视觉丢失时重置PID
+
     droneLink& link_;
     offboardControl& offboard_;
     servoControl& servo_;

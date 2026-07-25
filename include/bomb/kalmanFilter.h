@@ -42,9 +42,9 @@ public:
     void reset();
 
     // 可调参数
-    double processNoise = 0.01;   // Q: 过程噪声 (m²/s)
-    double measurementNoise = 0.05; // R: 观测噪声 (m²)
-    double maxVelocity = 1.0;      // 最大允许速度 (m/s)
+    double processNoise = 0.0001;      // 原 0.01
+    double measurementNoise = 0.02;   // 原 0.05
+    double maxVelocity = 0.3;         // 原 1.0
 
 private:
     double x_[4];       // 状态 [x, y, vx, vy]

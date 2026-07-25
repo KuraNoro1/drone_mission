@@ -39,28 +39,47 @@ class TargetTracker {
 public:
     TargetTracker();
 
+    // 更新追踪器：输入视觉检测列表、无人机状态、相机参数
     void update(const multiBucketData& detections,
                 const DroneState& drone,
                 const CameraIntrinsics& intrinsics,
                 const CameraExtrinsics& extrinsics);
 
+    // 锁定目标（仅桶ID，用于老逻辑）
     void lockTarget(int bucketId);
+
+    // 锁定目标并初始化世界坐标（推荐使用）
+    void lockTarget(int bucketId, const WorldTarget& initialPos);
+
+    // 解锁
     void unlock();
 
+    // 获取当前状态
     TargetState getState() const { return track_.state; }
     const char* stateName() const;
 
+    // 获取滤波后的世界坐标
     WorldTarget getWorldTarget() const;
 
+    // 判断是否有效（有目标且状态可接受）
     bool isValid() const;
+
+    // 尝试提交目标（当高度低于阈值且误差足够小时）
     bool tryCommit(double commitHeight);
+
+    // 是否已提交
     bool isCommitted() const { return track_.committed; }
 
+    // 是否有目标（已锁定）
     bool hasTarget() const { return lockedBucketId_ > 0; }
+
+    // 获取锁定的桶ID
     int getLockedId() const { return lockedBucketId_; }
+
+    // 丢失时长（秒）
     double lostDuration() const;
 
-    // 可调参数
+    // 可调参数（可在外部修改）
     double lostShortThreshold = 0.5;
     double lostLongThreshold  = 2.0;
     double commitAltThreshold = 3.0;

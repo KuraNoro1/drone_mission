@@ -10,10 +10,21 @@ TargetTracker::TargetTracker()
 }
 
 void TargetTracker::lockTarget(int bucketId) {
+    // 旧接口：仅锁定ID，世界坐标无效，Kalman未初始化
     lockedBucketId_ = bucketId;
     track_ = {bucketId, {0, 0, 0, false}, 0, 0, 0, 0, TargetState::LOST_CRITICAL, false, 0, 0, 0, 0};
     track_.worldPos.valid = false;
     kf_.reset();
+}
+
+void TargetTracker::lockTarget(int bucketId, const WorldTarget& initialPos) {
+    lockedBucketId_ = bucketId;
+    // 初始化轨迹，世界坐标直接使用传入值
+    track_ = {bucketId, initialPos, 0, 0, 0, 0, TargetState::VISIBLE, false, 0, 0, 0, 0};
+    track_.worldPos.valid = true;
+    track_.lastSeenTime = 0.0;   // 初始时刻视为刚看到
+    // 初始化 Kalman 滤波器
+    kf_.init(initialPos.north, initialPos.east);
 }
 
 void TargetTracker::unlock() {
@@ -43,10 +54,11 @@ void TargetTracker::update(const multiBucketData& detections,
         }
     }
 
-    // Kalman 预测
-    kf_.predict(0.05);
+    // Kalman 预测（每帧先预测一步）
+    kf_.predict(0.05);   // 固定步长50ms
 
     if (detected) {
+        // 将像素坐标转换为世界坐标
         double yawRad = drone.yawDeg * M_PI / 180.0;
         WorldTarget raw = pixelToWorld(found.cx, found.cy, 0,
                                         intrinsics, extrinsics,
@@ -57,23 +69,27 @@ void TargetTracker::update(const multiBucketData& detections,
             track_.rawNorth = raw.north;
             track_.rawEast  = raw.east;
 
-            // Kalman 更新
-            kf_.update(raw.north, raw.east);
+            // ★ 视觉恢复时，直接重置 Kalman 为观测值，消除漂移 ★
+            kf_.init(raw.north, raw.east);
 
-            track_.worldPos.north = kf_.getX();
-            track_.worldPos.east  = kf_.getY();
+            // 使用观测值（或重置后的值，效果相同）
+            track_.worldPos.north = raw.north;
+            track_.worldPos.east  = raw.east;
             track_.worldPos.valid = true;
             track_.confidence = 1.0;
             track_.lastSeenTime = elapsedTime_;
-
             track_.stableSeenFrames++;
             track_.consecutiveLostFrames = 0;  // 重置连续丢失计数
         } else {
+            // 像素转换失败，视为未检测到（保持原有逻辑）
             track_.consecutiveLostFrames++;
             track_.stableSeenFrames = 0;
             kf_.predictOnly(0.05);
             track_.worldPos.north = kf_.getX();
             track_.worldPos.east  = kf_.getY();
+            if (!track_.worldPos.valid && kf_.isInitialized()) {
+                track_.worldPos.valid = true;
+            }
         }
     } else {
         // 未检测到: Kalman预测 + 计数丢失帧
@@ -82,6 +98,10 @@ void TargetTracker::update(const multiBucketData& detections,
         kf_.predictOnly(0.05);
         track_.worldPos.north = kf_.getX();
         track_.worldPos.east  = kf_.getY();
+        // 如果Kalman已初始化，则世界坐标有效
+        if (kf_.isInitialized()) {
+            track_.worldPos.valid = true;
+        }
     }
 
     // ── 状态机: 基于连续丢失帧数 ──
@@ -108,7 +128,7 @@ void TargetTracker::update(const multiBucketData& detections,
         }
     }
 
-    // 尝试commit
+    // 尝试commit (只有在世界坐标有效且高度低于阈值时)
     if (!track_.committed && track_.worldPos.valid &&
         drone.alt <= commitAltThreshold) {
         double errN = drone.north - track_.worldPos.north;
