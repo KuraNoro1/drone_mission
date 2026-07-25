@@ -68,6 +68,9 @@ private:
     // ── 爬升 ──
     bool climbToSearchAlt();
 
+    // ── 飞回扫描原点 ──
+    bool flyToScanOrigin();
+
     void releasePayload(const std::string& side);
     DroneState getDroneState() const;
 
