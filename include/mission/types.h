@@ -51,6 +51,7 @@ struct servoConfig {
 struct flightConfig {
     double takeoffAlt;
     double cruiseAlt;
+    double dropAlt;          // 新增
 };
 
 struct dropZoneConfig {
@@ -81,6 +82,17 @@ struct connectionConfig {
 
 struct landingConfig {
     int rtlTimeout;
+};
+
+// 新增相机配置
+struct cameraConfig {
+    double fx;
+    double fy;
+    double cx;
+    double cy;
+    double offsetForward;
+    double offsetRight;
+    double offsetDown;
 };
 
 struct visualServoConfig {
@@ -116,6 +128,7 @@ struct missionConfigData {
     visionConfig vision;
     servoConfig servo;
     landingConfig landing;
+    cameraConfig camera;      // 新增
     int missionPriority;
 };
 

@@ -20,6 +20,7 @@ private:
     void parseVisualServo(const YAML::Node& node);
     void parseVision(const YAML::Node& node);
     void parseServo(const YAML::Node& node);
+    void parseCamera(const YAML::Node& node);   // 新增
 
     std::string configDir_;
     missionConfigData data_;

@@ -36,6 +36,7 @@ bool missionConfig::load() {
         parseVisualServo(loadFile("pid.yaml")["visualServo"]);
         parseVision(loadFile("vision.yaml")["vision"]);
         parseServo(loadFile("servo.yaml")["servo"]);
+        parseCamera(loadFile("camera.yaml")["camera"]);   // 新增
         return true;
     } catch (const std::exception& e) {
         log("ERROR: Config parse failed: " + std::string(e.what()));
@@ -54,6 +55,7 @@ void missionConfig::parseConnection(const YAML::Node& node) {
 void missionConfig::parseFlight(const YAML::Node& node) {
     data_.flight.takeoffAlt = node["takeoffAlt"].as<double>();
     data_.flight.cruiseAlt  = node["cruiseAlt"].as<double>();
+    data_.flight.dropAlt    = node["dropAlt"] ? node["dropAlt"].as<double>() : 1.0;  // 新增，带默认
     data_.landing.rtlTimeout = node["rtlTimeout"] ? node["rtlTimeout"].as<int>() : 120;
 }
 
@@ -110,4 +112,15 @@ void missionConfig::parseServo(const YAML::Node& node) {
     data_.servo.releasePwm       = node["releasePwm"].as<int>();
     data_.servo.holdPwm          = node["holdPwm"].as<int>();
     data_.servo.releaseDurationMs= node["releaseDurationMs"].as<int>();
+}
+
+// 新增相机解析
+void missionConfig::parseCamera(const YAML::Node& node) {
+    data_.camera.fx            = node["fx"] ? node["fx"].as<double>() : 554.26;
+    data_.camera.fy            = node["fy"] ? node["fy"].as<double>() : 554.26;
+    data_.camera.cx            = node["cx"] ? node["cx"].as<double>() : 320.0;
+    data_.camera.cy            = node["cy"] ? node["cy"].as<double>() : 320.0;
+    data_.camera.offsetForward = node["offsetForward"] ? node["offsetForward"].as<double>() : 0.15;
+    data_.camera.offsetRight   = node["offsetRight"]   ? node["offsetRight"].as<double>()   : 0.0;
+    data_.camera.offsetDown    = node["offsetDown"]    ? node["offsetDown"].as<double>()    : 0.0;
 }
