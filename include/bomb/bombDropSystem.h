@@ -104,4 +104,5 @@ private:
     std::chrono::steady_clock::time_point loopStart_;
     double scanOriginN_;    // 投弹区扫描原点 N
     double scanOriginE_;    // 投弹区扫描原点 E
+    bool lastHasPix_;   // 记录上一帧是否有像素，用于视觉丢失时重置PID
 };

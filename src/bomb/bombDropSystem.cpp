@@ -29,7 +29,10 @@ namespace {
 BombDropSystem::BombDropSystem(droneLink& link, offboardControl& offboard,
                                servoControl& servo, multiBucketPipe& bucketPipe)
     : link_(link), offboard_(offboard), servo_(servo), bucketPipe_(bucketPipe),
-      priority_(0), phase_(Phase::SCAN), dropCount_(0), initYaw_(0), currentTargetIdx_(-1) {}
+      priority_(0), phase_(Phase::SCAN), dropCount_(0), initYaw_(0),
+      currentTargetIdx_(-1), scanOriginN_(0), scanOriginE_(0),
+      lastHasPix_(false)   // 顺序与声明一致
+{}
 
 void BombDropSystem::configure(const DropConfig& cfg, const CameraIntrinsics& intrinsics,
                                const CameraExtrinsics& extrinsics, int priority) {
@@ -39,6 +42,8 @@ void BombDropSystem::configure(const DropConfig& cfg, const CameraIntrinsics& in
 void BombDropSystem::reset() {
     phase_ = Phase::SCAN; dropCount_ = 0; droppedSides_.clear();
     targetMap_.clear(); currentTargetIdx_ = -1;
+    scanOriginN_ = 0; scanOriginE_ = 0;
+    lastHasPix_ = false; 
 }
 
 DroneState BombDropSystem::getDroneState() const {
@@ -48,7 +53,7 @@ DroneState BombDropSystem::getDroneState() const {
             vel.northM, vel.eastM};
 }
 
-// ── 飞回扫描原点 ──────────────────────────────────────────
+// ── 辅助：飞回扫描原点 ──
 bool BombDropSystem::flyToScanOrigin() {
     if (scanOriginN_ == 0 && scanOriginE_ == 0) {
         log("Scan origin not recorded, staying at current position");
@@ -126,36 +131,63 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                 log("Phase: SCAN at " + std::to_string(cfg_.searchAlt) +
                     "m origin=(" + std::to_string(scanOriginN_).substr(0,5) + "," +
                     std::to_string(scanOriginE_).substr(0,5) + ")");
-                const int MAX_SCAN_TRIES = 3;
-                bool scanOk = false;
-                for (int t = 1; t <= MAX_SCAN_TRIES; ++t) {
-                    log("SCAN: attempt " + std::to_string(t) + "/" + std::to_string(MAX_SCAN_TRIES));
-                    if (scanForTargets(8.0)) { scanOk = true; break; }
-                    if (t < MAX_SCAN_TRIES) {
-                        log("SCAN: empty, retrying...");
-                        sleep_for(milliseconds(500));
-                    }
-                }
-                if (!scanOk) { result.timedOut = true; return result; }
+                if (!scanForTargets(8.0)) { result.timedOut = true; return result; }
                 phase_ = Phase::SELECT;
                 break;
             }
             case Phase::SELECT:
                 if (!selectNextTarget()) {
                     log("All mapped targets exhausted, re-scanning...");
-                    // 飞回扫描原点 (保留真机原有逻辑，但调用封装函数)
+                    // 飞回扫描原点（3.5m）
                     if (!flyToScanOrigin()) {
                         log("Failed to return to scan origin, abort");
-                        result.timedOut = true; return result;
+                        result.timedOut = true;
+                        return result;
                     }
-                    // 重新扫描 5 秒
-                    if (!scanForTargets(5.0)) {
+                    // 临时将搜索高度改为 4.0m (第一次高度 +0.5m)
+                    double originalSearchAlt = cfg_.searchAlt;
+                    double newSearchAlt = originalSearchAlt + 0.5;
+                    cfg_.searchAlt = newSearchAlt;
+                    log("Temporary re-scan height set to " + std::to_string(newSearchAlt) + "m");
+
+                    // 爬升至新高度（当前位置已位于原点，但高度为 originalSearchAlt）
+                    auto ned = link_.nedPosition();
+                    offboard_.stop(); sleep_for(milliseconds(300));
+                    if (!offboard_.startPositionModeAt(static_cast<float>(ned.northM),
+                                                       static_cast<float>(ned.eastM),
+                                                       static_cast<float>(-newSearchAlt),
+                                                       initYaw_)) {
+                        log("Failed to climb for re-scan");
+                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        result.timedOut = true;
+                        return result;
+                    }
+                    // 等待到达目标高度
+                    auto tClimb = steady_clock::now();
+                    while (duration<double>(steady_clock::now() - tClimb).count() < 10.0) {
+                        offboard_.setPositionNed(static_cast<float>(ned.northM),
+                                                 static_cast<float>(ned.eastM),
+                                                 static_cast<float>(-newSearchAlt),
+                                                 initYaw_);
+                        double alt = link_.altitude();
+                        if (std::abs(alt - newSearchAlt) < 0.3) break;
+                        sleep_for(milliseconds(200));
+                    }
+
+                    // 二次扫描 8 秒 (内部使用 cfg_.searchAlt，现已临时改为 newSearchAlt)
+                    if (!scanForTargets(8.0)) {
                         log("Re-scan found nothing, abort");
-                        result.timedOut = true; return result;
+                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        result.timedOut = true;
+                        return result;
                     }
+                    // 恢复原搜索高度
+                    cfg_.searchAlt = originalSearchAlt;
+
                     if (!selectNextTarget()) {
                         log("Re-scan still no targets");
-                        result.timedOut = true; return result;
+                        result.timedOut = true;
+                        return result;
                     }
                 }
                 phase_ = Phase::GOTO;
@@ -166,11 +198,11 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                 break;
             case Phase::TRACKING:
                 if (!trackAndDescend()) {
-                    log("TRACKING: failed, next target");
-                    targetMap_[currentTargetIdx_].used = true;
-                    phase_ = Phase::SELECT;
+                  log("TRACKING: failed, next target");
+                  targetMap_[currentTargetIdx_].used = true;
+                  phase_ = Phase::SELECT;
                 } else {
-                    phase_ = Phase::CLIMB;
+                    phase_ = Phase::CLIMB;   // 修改此处
                 }
                 break;
             case Phase::PREDICT:
@@ -193,11 +225,13 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
     return result;
 }
 
-// ── SCAN (增加重试逻辑已在上层实现) ─────────────────────
+// ── SCAN ───────────────────────────────────────────────────
+
 bool BombDropSystem::scanForTargets(double timeoutSec) {
     targetMap_.clear();
     auto t0 = steady_clock::now();
 
+    // 像素聚类: 按位置而非YOLO标签跟踪
     struct ClusterTrack { double cx, cy; std::map<int, int> idVotes; int stableFrames; };
     std::map<int, ClusterTrack> clusters;
     int nextClusterId = 0;
@@ -211,10 +245,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             static_cast<float>(-cfg_.searchAlt), initYaw_);
     }
 
-    log("Scanning for buckets...");
-
-    auto lastNonEmpty = steady_clock::now();
-    const double CLUSTER_EXPIRE_SEC = 2.0;
+    log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m...");
 
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
@@ -224,15 +255,10 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
         multiBucketData vis;
         if (!bucketPipe_.readLatest(vis) || vis.empty()) {
-            double idleSec = duration<double>(steady_clock::now() - lastNonEmpty).count();
-            if (idleSec > CLUSTER_EXPIRE_SEC) {
-                clusters.clear();
-                lastNonEmpty = steady_clock::now();
-            }
-            sleep_for(milliseconds(100)); continue;
+            clusters.clear(); sleep_for(milliseconds(100)); continue;
         }
-        lastNonEmpty = steady_clock::now();
 
+        // 当前帧: 每个检测分配到最近簇
         std::set<int> matchedIds;
         std::map<int, std::vector<bucketDetection>> clusterDets;
 
@@ -250,6 +276,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             }
         }
 
+        // 更新簇
         for (const auto& [cid, dets] : clusterDets) {
             double sumCx = 0, sumCy = 0;
             for (const auto& d : dets) { sumCx += d.cx; sumCy += d.cy; }
@@ -263,6 +290,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             cl.cx = nCx; cl.cy = nCy;
             for (const auto& d : dets) cl.idVotes[d.bucketId]++;
 
+            // 稳定后添加地图
             if (cl.stableFrames >= STABLE_FRAMES) {
                 int bestId = 0, bestV = 0;
                 for (const auto& [id, v] : cl.idVotes)
@@ -273,10 +301,11 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
                 WorldTarget wt = pixelToWorld(cl.cx, cl.cy, 0, intrinsics_, extrinsics_,
                                                alt, 0, 0, yawRad, ned.northM, ned.eastM);
                 if (wt.valid) {
+                    // 坐标边界检查: 相对于扫描时无人机位置, 限制在±20m范围内
                     double maxRange = 20.0;
                     if (std::abs(wt.north - ned.northM) > maxRange ||
                         std::abs(wt.east  - ned.eastM)  > maxRange) {
-                        continue;
+                        continue; // 出界, 跳过
                     }
                     bool dup = false;
                     for (const auto& e : targetMap_)
@@ -294,6 +323,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             }
         }
 
+        // 清除未匹配簇
         for (auto it = clusters.begin(); it != clusters.end(); )
             if (matchedIds.find(it->first) == matchedIds.end())
                 it = clusters.erase(it);
@@ -329,35 +359,206 @@ bool BombDropSystem::selectNextTarget() {
 // ── GOTO ───────────────────────────────────────────────────
 
 bool BombDropSystem::gotoWorldTarget() {
-    const auto& t = targetMap_[currentTargetIdx_].world;
-    float tN = static_cast<float>(t.north);
-    float tE = static_cast<float>(t.east);
-    float tD = static_cast<float>(-cfg_.approachAlt);
+    const auto& target = targetMap_[currentTargetIdx_];
+    const auto& t = target.world;
+
+    tracker_->lockTarget(target.bucketId, t);
+    pidX_->reset();
+    pidY_->reset();
+    pidX_->setMaxOutput(cfg_.maxVelXY);
+    pidY_->setMaxOutput(cfg_.maxVelXY);
+    lastHasPix_ = false;
 
     offboard_.stop();
-    if (!offboard_.startPositionModeAt(tN, tE, tD, initYaw_)) return false;
+    sleep_for(milliseconds(300));
+    if (!offboard_.startVelocityMode()) {
+        log("GOTO: Failed to start velocity mode");
+        return false;
+    }
 
-    log("GOTO: (" + std::to_string(t.north).substr(0,5) + "," +
+    log("GOTO: Flying to bucket " + std::string(bucketLabel(target.bucketId)) +
+        " world(" + std::to_string(t.north).substr(0,5) + "," +
         std::to_string(t.east).substr(0,5) + ") at " +
-        std::to_string(cfg_.approachAlt) + "m");
+        std::to_string(cfg_.approachAlt) + "m (visual servo enabled)");
 
     auto t0 = steady_clock::now();
-    while (duration<double>(steady_clock::now() - t0).count() < cfg_.gotoTimeout) {
-        offboard_.setPositionNed(tN, tE, tD, initYaw_);
-        auto ned = link_.nedPosition();
-        double hDist = std::hypot(ned.northM - t.north, ned.eastM - t.east);
-        double alt = link_.altitude();
-        double altErr = std::abs(alt - cfg_.approachAlt);
-        if (hDist < 0.5 && altErr < 0.5) {
-            log("GOTO: arrived");
-            return true;
+    const double TIMEOUT = cfg_.gotoTimeout;
+    const double ARRIVAL_TOL = 0.3;
+    bool arrived = false;
+    double stableStart = 0;
+    bool wasStable = false;
+
+    // ── 视觉稳定性状态 ──
+    int stablePixFrames = 0;
+    bool visualStable = false;
+    bool pidResetPending = false;
+    double lastPixTime = 0;
+    double boost = 1.0;
+    double boostStartTime = 0;
+    char buf[256];  // 用于格式化日志
+
+    while (duration<double>(steady_clock::now() - t0).count() < TIMEOUT) {
+        DroneState ds = getDroneState();
+        double alt = ds.alt;
+        double now = duration<double>(steady_clock::now() - t0).count();
+
+        multiBucketData vis;
+        bucketPipe_.readLatest(vis);
+        tracker_->update(vis, ds, intrinsics_, extrinsics_);
+
+        WorldTarget wt = tracker_->getWorldTarget();
+        bool hasWorldPos = wt.valid;
+
+        bool hasPix = false;
+        double pixCx = 0, pixCy = 0;
+        if (!vis.empty()) {
+            for (const auto& b : vis.buckets) {
+                if (b.bucketId == tracker_->getLockedId()) {
+                    pixCx = b.cx; pixCy = b.cy; hasPix = true;
+                    break;
+                }
+            }
         }
-        sleep_for(milliseconds(200));
+
+        // ── 更新视觉稳定性 ──
+        if (hasPix) {
+            stablePixFrames++;
+            lastPixTime = now;
+        } else {
+            stablePixFrames = 0;
+        }
+
+        bool prevVisualStable = visualStable;
+        visualStable = (stablePixFrames >= 3);
+
+        // ── 处理视觉状态变化 ──
+        if (!prevVisualStable && visualStable) {
+            double lostDuration = now - lastPixTime;
+            if (lostDuration > 0.5) {
+                pidX_->reset();
+                pidY_->reset();
+                std::snprintf(buf, sizeof(buf), "GOTO: visual stable regained after %.2fs, resetting PID", lostDuration);
+                log(buf);
+            }
+            boostStartTime = now;
+            pidResetPending = false;
+        } else if (prevVisualStable && !visualStable) {
+            pidResetPending = true;
+        }
+
+        if (pidResetPending && (now - lastPixTime > 1.0)) {
+            pidX_->reset();
+            pidY_->reset();
+            pidResetPending = false;
+            log("GOTO: visual lost for >1s, resetting PID");
+        }
+
+        // ── 计算增益boost ──
+        if (visualStable) {
+            double elapsedBoost = now - boostStartTime;
+            if (elapsedBoost < 0.5) {
+                boost = 1.0 + 0.5 * (elapsedBoost / 0.5);
+            } else if (elapsedBoost < 1.5) {
+                boost = 1.5 - 0.5 * ((elapsedBoost - 0.5) / 1.0);
+            } else {
+                boost = 1.0;
+            }
+        } else {
+            boost = 1.0;
+        }
+
+        // ── 水平控制 ──
+        double vx = 0, vy = 0;
+        if (hasPix && visualStable) {
+            double errX = (pixCx - intrinsics_.cx) / intrinsics_.cx;
+            double errY = (pixCy - intrinsics_.cy) / intrinsics_.cy;
+            double kp = cfg_.kpXY * boost;
+            vx = kp * errY;
+            vy = -kp * errX;
+            double vMag = std::hypot(vx, vy);
+            double maxV = cfg_.maxVelXY * 0.8;
+            if (vMag > maxV) { vx = vx / vMag * maxV; vy = vy / vMag * maxV; }
+        } else if (hasWorldPos) {
+            double errN = wt.north - ds.north;
+            double errE = wt.east - ds.east;
+            double k = 0.6;
+            vx = k * errN;
+            vy = k * errE;
+            double vMag = std::hypot(vx, vy);
+            double maxV = cfg_.maxVelXY * 0.6;
+            if (vMag > maxV) { vx = vx / vMag * maxV; vy = vy / vMag * maxV; }
+        } else {
+            vx = 0; vy = 0;
+        }
+
+        // ── 高度控制 ──
+        double maxVz = 0.5;
+        double altErr = alt - cfg_.approachAlt;
+        double vz = cfg_.kpZ * altErr;
+        vz = std::max(-maxVz, std::min(maxVz, vz));
+
+        offboard_.setVelocityNed(static_cast<float>(vx), static_cast<float>(vy),
+                                 static_cast<float>(vz), initYaw_);
+
+        // ── 到达判定 ──
+        bool posOk = false;
+        if (hasWorldPos) {
+            double worldDist = std::hypot(wt.north - ds.north, wt.east - ds.east);
+            posOk = worldDist < ARRIVAL_TOL;
+        } else {
+            double worldDist = std::hypot(t.north - ds.north, t.east - ds.east);
+            posOk = worldDist < ARRIVAL_TOL;
+        }
+        bool visOk = visualStable || tracker_->isCommitted();
+
+        if (posOk && visOk) {
+            if (!wasStable) {
+                stableStart = now;
+                wasStable = true;
+            }
+            if (now - stableStart > 0.5) {
+                log("GOTO: Arrived at target with visual lock");
+                arrived = true;
+                break;
+            }
+        } else {
+            wasStable = false;
+        }
+
+        static int gotoLogCnt = 0;
+        if (++gotoLogCnt % 5 == 1) {
+            double dist = hasWorldPos ? std::hypot(wt.north - ds.north, wt.east - ds.east)
+                                      : std::hypot(t.north - ds.north, t.east - ds.east);
+            std::snprintf(buf, sizeof(buf),
+                "[GOTO] alt=%.1f hasPix=%d dist=%.2f v=(%.2f,%.2f,%.2f) boost=%.2f stable=%d",
+                alt, hasPix, dist, vx, vy, vz, boost, visualStable);
+            log(buf);
+        }
+        sleep_for(milliseconds(50));
     }
-    log("GOTO: timeout"); return false;
+
+    if (!arrived) {
+        DroneState ds = getDroneState();
+        WorldTarget wt = tracker_->getWorldTarget();
+        if (wt.valid && std::hypot(wt.north - ds.north, wt.east - ds.east) < 0.8) {
+            log("GOTO: Timeout but close enough, proceeding");
+            arrived = true;
+        } else {
+            log("GOTO: Timeout");
+            offboard_.setVelocityNed(0, 0, 0, initYaw_);
+            return false;
+        }
+    }
+
+    auto hoverT0 = steady_clock::now();
+    while (duration<double>(steady_clock::now() - hoverT0).count() < 0.5) {
+        offboard_.setVelocityNed(0, 0, 0, initYaw_);
+        sleep_for(milliseconds(50));
+    }
+    return true;
 }
 
-// ── TRACKING (使用 hasPixelTarget 和世界坐标) ────
+// ── TRACKING — 丢后飞往最后一帧的世界坐标（世界坐标收敛即可投弹） ─────────────
 
 bool BombDropSystem::trackAndDescend() {
     const auto& target = targetMap_[currentTargetIdx_];
@@ -368,7 +569,6 @@ bool BombDropSystem::trackAndDescend() {
     offboard_.stop();
     if (!offboard_.startVelocityMode()) return false;
 
-    // 悬停过渡
     {
         auto hoverT0 = steady_clock::now();
         while (duration<double>(steady_clock::now() - hoverT0).count() < 1.0) {
@@ -377,10 +577,18 @@ bool BombDropSystem::trackAndDescend() {
         }
     }
 
-    tracker_->lockTarget(target.bucketId, target.world);
-    pidX_->reset(); pidY_->reset();
-    pidX_->setMaxOutput(cfg_.maxVelXY);
-    pidY_->setMaxOutput(cfg_.maxVelXY);
+    if (!tracker_->hasTarget() || tracker_->getLockedId() != target.bucketId) {
+        tracker_->lockTarget(target.bucketId, target.world);
+        pidX_->reset();
+        pidY_->reset();
+        pidX_->setMaxOutput(cfg_.maxVelXY);
+        pidY_->setMaxOutput(cfg_.maxVelXY);
+        lastHasPix_ = false;
+    } else {
+        pidX_->reset();
+        pidY_->reset();
+        log("TRACKING: Continuing existing lock on bucket " + std::string(bucketLabel(target.bucketId)));
+    }
 
     double cx = intrinsics_.cx, cy = intrinsics_.cy;
     bool reachedDropAlt = false;
@@ -388,10 +596,20 @@ bool BombDropSystem::trackAndDescend() {
     bool wasConverged = false;
     auto convergeStart = steady_clock::now();
     auto trackingStart = steady_clock::now();
-    const double TRACKING_TIMEOUT = 60.0;
-    const double DROP_ALT_TIMEOUT = 15.0;
-    const double WORLD_CONVERGE_TOL = 0.30;
+    const double TRACKING_TIMEOUT = 90.0;
+    const double DROP_ALT_TIMEOUT = 20.0;
+    const double WORLD_CONVERGE_TOL = 0.30; 
     const double STABLE_DURATION = 0.2;
+
+    // ── 视觉稳定性状态 ──
+    int stablePixFrames = 0;
+    bool visualStable = false;
+    bool pidResetPending = false;
+    double lastPixTime = 0;
+    double boost = 1.0;
+    double boostStartTime = 0;
+
+    char buf[256];
 
     while (true) {
         DroneState ds = getDroneState();
@@ -399,7 +617,7 @@ bool BombDropSystem::trackAndDescend() {
         double elapsed = duration<double>(steady_clock::now() - trackingStart).count();
 
         if (elapsed > TRACKING_TIMEOUT) {
-            log("TRACKING: timeout");
+            log("TRACKING: timeout " + std::to_string(TRACKING_TIMEOUT) + "s");
             offboard_.setVelocityNed(0, 0, 0, initYaw_);
             return false;
         }
@@ -412,41 +630,94 @@ bool BombDropSystem::trackAndDescend() {
         WorldTarget wt = tracker_->getWorldTarget();
         bool hasWorldPos = wt.valid;
 
-        // 水平控制
-        double vx = 0, vy = 0;
-        if (tracker_->hasPixelTarget()) {
-            PixelTarget pt = tracker_->getPixelTarget();
-            vx = pidX_->update((cy - pt.cy) / cx, 0.05);
-            vy = pidY_->update(-(cx - pt.cx) / cy, 0.05);
-        } else if (hasWorldPos) {
-            double errN = wt.north - ds.north;
-            double errE = wt.east  - ds.east;
-            if (tracker_->isCommitted()) {
-                vx = pidX_->update(errN, 0.05);
-                vy = pidY_->update(errE, 0.05);
-            } else {
-                double k = 0.15;
-                vx = k * errN;
-                vy = k * errE;
-                double vm = std::hypot(vx, vy);
-                if (vm > cfg_.maxVelXY * 0.2) {
-                    vx = vx / vm * cfg_.maxVelXY * 0.2;
-                    vy = vy / vm * cfg_.maxVelXY * 0.2;
+        bool hasPix = false;
+        double pixCx = 0, pixCy = 0;
+        if (!vis.empty()) {
+            for (const auto& b : vis.buckets) {
+                if (b.bucketId == tracker_->getLockedId()) {
+                    pixCx = b.cx; pixCy = b.cy; hasPix = true;
+                    break;
                 }
             }
+        }
+
+        // ── 更新视觉稳定性 ──
+        if (hasPix) {
+            stablePixFrames++;
+            lastPixTime = elapsed;
+        } else {
+            stablePixFrames = 0;
+        }
+
+        bool prevVisualStable = visualStable;
+        visualStable = (stablePixFrames >= 3);
+
+        // ── 处理状态变化 ──
+        if (!prevVisualStable && visualStable) {
+            double lostDuration = elapsed - lastPixTime;
+            if (lostDuration > 0.5) {
+                pidX_->reset();
+                pidY_->reset();
+                std::snprintf(buf, sizeof(buf), "TRACKING: visual stable regained after %.2fs, resetting PID", lostDuration);
+                log(buf);
+            }
+            boostStartTime = elapsed;
+            pidResetPending = false;
+        } else if (prevVisualStable && !visualStable) {
+            pidResetPending = true;
+        }
+
+        if (pidResetPending && (elapsed - lastPixTime > 1.0)) {
+            pidX_->reset();
+            pidY_->reset();
+            pidResetPending = false;
+            log("TRACKING: visual lost for >1s, resetting PID");
+        }
+
+        // ── 平滑boost ──
+        if (visualStable) {
+            double bElapsed = elapsed - boostStartTime;
+            if (bElapsed < 0.5) boost = 1.0 + 0.5 * (bElapsed / 0.5);
+            else if (bElapsed < 1.5) boost = 1.5 - 0.5 * ((bElapsed - 0.5) / 1.0);
+            else boost = 1.0;
+        } else {
+            boost = 1.0;
+        }
+
+        // ── 水平控制 ──
+        double vx = 0, vy = 0;
+        if (hasPix && visualStable) {
+            double errX = (pixCx - cx) / cx;
+            double errY = (pixCy - cy) / cy;
+            double kp = cfg_.kpXY * boost;
+            vx = kp * errY;
+            vy = -kp * errX;
+            double vMag = std::hypot(vx, vy);
+            double maxV = cfg_.maxVelXY * 0.8;
+            if (vMag > maxV) { vx = vx / vMag * maxV; vy = vy / vMag * maxV; }
+        } else if (hasWorldPos) {
+            double errN = wt.north - ds.north;
+            double errE = wt.east - ds.east;
+            double k = 0.4;
+            vx = k * errN;
+            vy = k * errE;
+            double vMag = std::hypot(vx, vy);
+            double maxV = cfg_.maxVelXY * 0.5;
+            if (vMag > maxV) { vx = vx / vMag * maxV; vy = vy / vMag * maxV; }
         } else {
             vx = 0; vy = 0;
         }
 
-        // 高度控制
+        // ── 高度控制 ──
         const double MIN_SAFE_ALT = 0.6;
         const double MAX_DESCENT_RATE = 0.3;
         const double DECEL_ZONE = 0.6;
-        bool canDescend = tracker_->hasPixelTarget() || hasWorldPos || tracker_->isCommitted();
         double vz = 0;
+        bool canDescend = visualStable || hasWorldPos || tracker_->isCommitted();
+
         if (alt < MIN_SAFE_ALT) {
             vz = MAX_DESCENT_RATE;
-            log("TRACKING: WARNING alt low, forcing ascent!");
+            log("TRACKING: WARNING alt=" + std::to_string(alt).substr(0,4) + "m below safe floor, forcing ascent!");
         } else if (!reachedDropAlt) {
             if (alt > cfg_.dropAlt + 0.15 && canDescend) {
                 double altToDrop = alt - cfg_.dropAlt;
@@ -456,71 +727,49 @@ bool BombDropSystem::trackAndDescend() {
                 } else {
                     vz = cfg_.kpZ * altToDrop;
                 }
-                vz = std::max(-MAX_DESCENT_RATE * 0.5,
-                              std::min(MAX_DESCENT_RATE, vz));
+                vz = std::max(-MAX_DESCENT_RATE * 0.5, std::min(MAX_DESCENT_RATE, vz));
             } else {
                 vz = 0;
             }
-            if (alt <= cfg_.dropAlt + 0.15) {
-                if (!reachedDropAlt) {
-                    reachedDropAlt = true;
-                    reachedDropAltTime = elapsed;
-                    log("TRACKING: reached drop alt");
-                }
+            if (alt <= cfg_.dropAlt + 0.15 && !reachedDropAlt) {
+                reachedDropAlt = true;
+                reachedDropAltTime = elapsed;
+                log("TRACKING: reached drop alt " + std::to_string(alt).substr(0,4) + "m");
             }
         } else {
             vz = cfg_.kpZ * (alt - cfg_.dropAlt);
-            vz = std::max(-MAX_DESCENT_RATE * 0.5,
-                          std::min(MAX_DESCENT_RATE * 0.5, vz));
+            vz = std::max(-MAX_DESCENT_RATE * 0.5, std::min(MAX_DESCENT_RATE * 0.5, vz));
         }
 
         offboard_.setVelocityNed(static_cast<float>(vx), static_cast<float>(vy),
                                  static_cast<float>(vz), initYaw_);
 
-        // 日志
         static int trkLogCnt = 0;
         if (++trkLogCnt % 10 == 1) {
-            char buf[220];
-            double pixelErr = tracker_->hasPixelTarget() ?
-                std::hypot(cx - tracker_->getPixelTarget().cx, cy - tracker_->getPixelTarget().cy) : -1;
+            double pixelErr = hasPix ? std::hypot(cx - pixCx, cy - pixCy) : -1;
             double worldDist = hasWorldPos ? std::hypot(wt.north - ds.north, wt.east - ds.east) : -1;
             std::snprintf(buf, sizeof(buf),
                 "[TRACK] %s commit=%d alt=%.1fm v(%.2f,%.2f,%.2f) pixelErr=%.0fpx "
-                "worldDist=%.2fm lost=%.1fs",
+                "worldDist=%.2fm lost=%.1fs boost=%.2f stable=%d",
                 tracker_->stateName(), tracker_->isCommitted(),
-                alt, vx, vy, vz, pixelErr, worldDist, tracker_->lostDuration());
+                alt, vx, vy, vz, pixelErr, worldDist, tracker_->lostDuration(), boost, visualStable);
             log(buf);
         }
 
-        // 投弹判断
         if (ts == TargetState::LOST_CRITICAL && !tracker_->isCommitted() && !hasWorldPos) {
-            log("TRACKING: lost critical, abort");
+            log("TRACKING: lost critical, no world pos, abort");
             return false;
         }
 
         if (reachedDropAlt) {
-            double pixelErr = 1e9;
-            bool hasVis = tracker_->hasPixelTarget();
-            if (hasVis) {
-                PixelTarget pt = tracker_->getPixelTarget();
-                pixelErr = std::hypot(cx - pt.cx, cy - pt.cy);
-            }
             double worldErr = 1e9;
-            if (hasWorldPos) {
-                worldErr = std::hypot(wt.north - ds.north, wt.east - ds.east);
-            }
+            if (hasWorldPos) worldErr = std::hypot(wt.north - ds.north, wt.east - ds.east);
             double velMag = std::hypot(ds.vx, ds.vy);
-
-            bool pixConverged = false;
-            if (hasVis) pixConverged = (pixelErr < cfg_.convergeTolPx);
-            else if (hasWorldPos) pixConverged = (worldErr < WORLD_CONVERGE_TOL);
-            if (tracker_->isCommitted()) pixConverged = true;
-
             bool velOk = velMag < cfg_.velZeroTol;
             bool altOk = std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
-            bool hasTarget = hasVis || hasWorldPos || tracker_->isCommitted();
+            bool converged = (hasWorldPos && worldErr < WORLD_CONVERGE_TOL) || tracker_->isCommitted();
 
-            if (pixConverged && velOk && altOk && hasTarget) {
+            if (converged && velOk && altOk) {
                 if (!wasConverged) {
                     convergeStart = steady_clock::now();
                     wasConverged = true;
@@ -535,15 +784,13 @@ bool BombDropSystem::trackAndDescend() {
 
                     log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
                     log(">>>>> DROP " + side + " (" + std::to_string(dropCount_+1) + "/2) <<<<<");
-                    log("     err=" + std::to_string(pixelErr).substr(0,4) + "px worldErr=" +
-                        std::to_string(worldErr).substr(0,4) + "m vel=" +
-                        std::to_string(velMag).substr(0,4) + "m/s alt=" +
-                        std::to_string(alt).substr(0,4) + "m commit=" +
-                        (tracker_->isCommitted() ? "yes" : "no"));
-                    log("     impact=(" + std::to_string(impN).substr(0,4) + "," +
-                        std::to_string(impE).substr(0,4) + ")m");
+                    std::snprintf(buf, sizeof(buf),
+                        "     worldErr=%.2fm vel=%.2fm/s alt=%.2fm commit=%d",
+                        worldErr, velMag, alt, tracker_->isCommitted());
+                    log(buf);
+                    std::snprintf(buf, sizeof(buf), "     impact=(%.2f,%.2f)m", impN, impE);
+                    log(buf);
                     log("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
-
                     releasePayload(side);
                     return true;
                 }
@@ -557,25 +804,174 @@ bool BombDropSystem::trackAndDescend() {
                 return false;
             }
         }
-
         sleep_for(milliseconds(50));
     }
 }
 
 // ── PREDICT ────────────────────────────────────────────────
-bool BombDropSystem::predictAndDrop() {
-    // 保持原有实现不变（真机暂未使用，可保留）
-    log("PREDICT: (unused)");
-    return false;
-}
 
+bool BombDropSystem::predictAndDrop() {
+    log("PREDICT: waiting at " + std::to_string(cfg_.dropAlt) + "m");
+
+    double cx = intrinsics_.cx, cy = intrinsics_.cy;
+    auto stableStart = steady_clock::now();
+    auto predictStart = steady_clock::now();
+    bool wasStable = false;
+    const double PREDICT_TIMEOUT = 15.0;
+    const double LOST_FAIL_TIMEOUT = 5.0;
+
+    while (true) {
+        double predictElapsed = duration<double>(steady_clock::now() - predictStart).count();
+        if (predictElapsed > PREDICT_TIMEOUT) {
+            log("PREDICT: timeout " + std::to_string(PREDICT_TIMEOUT) + "s, aborting");
+            return false;
+        }
+        if (!tracker_->isCommitted() && tracker_->lostDuration() > LOST_FAIL_TIMEOUT) {
+            log("PREDICT: lost target for " + std::to_string(LOST_FAIL_TIMEOUT) + "s without commit, aborting");
+            return false;
+        }
+
+        DroneState ds = getDroneState();
+        double alt = ds.alt;
+        auto vel = link_.nedVelocity();
+        double velMag = std::hypot(vel.northM, vel.eastM);
+
+        // 喂入Tracker
+        multiBucketData vis;
+        bucketPipe_.readLatest(vis);
+        tracker_->update(vis, ds, intrinsics_, extrinsics_);
+
+        // 从当前帧中查找锁定桶的像素坐标
+        bool hasVis = false;
+        double errX = 0, errY = 0;
+        if (!vis.empty()) {
+            for (const auto& b : vis.buckets) {
+                if (b.bucketId == tracker_->getLockedId()) {
+                    errX = cx - b.cx;
+                    errY = cy - b.cy;
+                    hasVis = true;
+                    break;
+                }
+            }
+        }
+
+        // 计算像素误差（若无视觉且未committed，则设为极大值防止误触发）
+        double pixelErr;
+        if (hasVis) {
+            pixelErr = std::hypot(errX, errY);
+        } else {
+            if (tracker_->isCommitted()) {
+                // 已committed时用世界坐标误差替代（单位为m）
+                WorldTarget wt = tracker_->getWorldTarget();
+                double worldErr = std::hypot(wt.north - ds.north, wt.east - ds.east);
+                pixelErr = worldErr * 100;  // 放大，用于日志对比，但不作为条件
+            } else {
+                pixelErr = 1e9;  // 无视觉且未committed，条件不满足
+            }
+        }
+
+        // 高度控制
+        const double MIN_SAFE_ALT = 0.6;
+        const double MAX_DESCENT_RATE = 0.3;
+        double vz;
+        if (alt < MIN_SAFE_ALT) {
+            vz = MAX_DESCENT_RATE;
+        } else {
+            vz = cfg_.kpZ * (alt - cfg_.dropAlt);
+            vz = std::max(-MAX_DESCENT_RATE * 0.5,
+                          std::min(MAX_DESCENT_RATE * 0.5, vz));
+        }
+
+        // 水平控制
+        double vx = 0, vy = 0;
+        if (hasVis) {
+            vx = pidX_->update(errY / cx, 0.05);
+            vy = pidY_->update(-errX / cy, 0.05);
+        } else if (tracker_->isCommitted()) {
+            WorldTarget wt = tracker_->getWorldTarget();
+            double errN = wt.north - ds.north;
+            double errE = wt.east  - ds.east;
+            double k = 0.30;
+            vx = k * errN;
+            vy = k * errE;
+        }
+
+        offboard_.setVelocityNed(
+            static_cast<float>(vx), static_cast<float>(vy),
+            static_cast<float>(vz), initYaw_);
+
+        // ── 投弹条件 ──
+        bool cond1 = false;
+        if (hasVis) {
+            cond1 = (pixelErr < cfg_.convergeTolPx);
+        } else {
+            // 无视觉时，只有已committed且世界坐标误差小才视为收敛
+            if (tracker_->isCommitted()) {
+                WorldTarget wt = tracker_->getWorldTarget();
+                double worldErr = std::hypot(wt.north - ds.north, wt.east - ds.east);
+                cond1 = (worldErr < 0.3);   // 世界坐标收敛阈值 (m)
+            } else {
+                cond1 = false;
+            }
+        }
+
+        bool cond2 = velMag < cfg_.velZeroTol;
+        bool cond3 = std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
+        bool cond5 = hasVis || (tracker_->isCommitted() && tracker_->lostDuration() < 3.0);
+
+        static int pdLogCnt = 0;
+        if (++pdLogCnt % 5 == 1) {
+            char buf[220];
+            std::snprintf(buf, sizeof(buf),
+                "[PREDICT] alt=%.1fm dropAlt=%.1f err=%.1fpx vel=%.2fm/s "
+                "C1=%d C2=%d C3=%d C5=%d hasVis=%d commit=%d lost=%.1fs",
+                alt, cfg_.dropAlt, pixelErr, velMag,
+                cond1, cond2, cond3, cond5, hasVis,
+                tracker_->isCommitted(), tracker_->lostDuration());
+            log(buf);
+        }
+
+        if (cond1 && cond2 && cond3 && cond5) {
+            if (!wasStable) {
+                stableStart = steady_clock::now();
+                wasStable = true;
+            }
+            double sd = duration<double>(steady_clock::now() - stableStart).count();
+            if (sd >= cfg_.stableDuration) {
+                std::string side = (dropCount_ == 0) ? "Left" :
+                    ((droppedSides_[0] == "Left") ? "Right" : "Left");
+                double g = 9.81;
+                double tFall = std::sqrt(2.0 * alt / g);
+                double impN = vel.northM * tFall, impE = vel.eastM * tFall;
+
+                log("========================================");
+                log(">>>>> DROP " + side + " (" + std::to_string(dropCount_+1) + "/2) <<<<<");
+                log("     err=" + std::to_string(pixelErr).substr(0,4) + "px vel=" +
+                    std::to_string(velMag).substr(0,4) + "m/s alt=" +
+                    std::to_string(alt).substr(0,4) + "m commit=" +
+                    (tracker_->isCommitted() ? "yes" : "no"));
+                log("     impact=(" + std::to_string(impN).substr(0,4) + "," +
+                    std::to_string(impE).substr(0,4) + ")m");
+                log("========================================");
+
+                releasePayload(side);
+                return true;
+            }
+        } else {
+            wasStable = false;
+        }
+
+        sleep_for(milliseconds(50));
+    }
+}
 // ── CLIMB ──────────────────────────────────────────────────
 
 bool BombDropSystem::climbToSearchAlt() {
     log("CLIMB: to " + std::to_string(cfg_.searchAlt) + "m");
     tracker_->unlock();
+    offboard_.stop(); sleep_for(milliseconds(300));
     auto ned = link_.nedPosition();
-    if (!offboard_.switchToPositionMode(
+    if (!offboard_.startPositionModeAt(
             static_cast<float>(ned.northM), static_cast<float>(ned.eastM),
             static_cast<float>(-cfg_.searchAlt), initYaw_)) return false;
 
@@ -599,4 +995,5 @@ void BombDropSystem::releasePayload(const std::string& side) {
     servo_.setPwm(ch, cfg_.holdPwm);
     droppedSides_.push_back(side);
     dropCount_++;
+    log("releasePayload: dropCount_ = " + std::to_string(dropCount_));
 }
