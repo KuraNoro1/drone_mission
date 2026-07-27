@@ -66,7 +66,7 @@ bool missionStateMachine::init() {
         DropConfig dropCfg;
         const auto& vsCfg = config_.visualServo;
         dropCfg.searchAlt       = 3.5;
-        dropCfg.approachAlt     = 1.4;          // 接近目标高度
+        dropCfg.approachAlt     = dropCfg.searchAlt;  // 先飞到扫描高度（3.5m）保持视觉锁定
         dropCfg.dropAlt         = config_.flight.dropAlt;   // 从配置读取
         dropCfg.gotoTimeout     = 10.0;
         dropCfg.stableDuration  = 0.3;
