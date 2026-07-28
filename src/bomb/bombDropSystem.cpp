@@ -395,14 +395,14 @@ bool BombDropSystem::centerAboveTarget() {
     const double LOST_TIMEOUT = 5.0;
     const double CONVERGE_TOL_PX = 15.0;
     const double STABLE_DURATION = 0.6;
-    const double MAX_MATCH_PX = 200.0;
+    const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;    // 置信度保持1.0的时长 (s)
     const double CONF_DECAY = 1.5;    // 置信度从1.0衰减到min的时长 (s)
     const double CONF_MIN = 0.40;     // 最低置信度 (保证始终有弱控制)
 
     bool wasConverged = false;
     auto convergeStart = t0;
-    auto lastPixTime = t0;    // 初始装作刚看到, confidence=1.0 起步
+    auto lastPixTime = t0 - seconds(10);    // 初始无像素, 立即激活世界坐标兜底
     char buf[256];
 
     while (true) {
@@ -454,20 +454,40 @@ bool BombDropSystem::centerAboveTarget() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制: 像素→机体速度→NED (yaw旋转) ──
+        // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
         double vx = 0, vy = 0;
         if (confidence > 0.01) {
             // 机体坐标系速度: 像素上方=前, 像素左侧=左
-            double errU = (pixCx - cx) / cx;  // 像素水平误差 (列方向)
-            double errV = (pixCy - cy) / cy;  // 像素垂直误差 (行方向, 上方为负)
-            double bodyFwd = pidX_->update(-errV, 0.05);  // 像素上方 → 前
-            double bodyRgt = pidY_->update( errU, 0.05);  // 像素左侧 → 左 (机体Y负)
+            double errU = (pixCx - cx) / cx;
+            double errV = (pixCy - cy) / cy;
+            double bodyFwd = pidX_->update(-errV, 0.05);
+            double bodyRgt = pidY_->update( errU, 0.05);
             bodyFwd *= confidence;
             bodyRgt *= confidence;
             double yawRad = initYaw_ * M_PI / 180.0;
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-            double maxVel = cfg_.maxVelXY * 0.6 * confidence;
+
+            // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
+            if (!hasPix && sincePix > 0.5) {
+                const auto& t = targetMap_[currentTargetIdx_].world;
+                double errN = t.north - ds.north;
+                double errE = t.east  - ds.east;
+                double distW = std::hypot(errN, errE);
+                if (distW > 0.3) {
+                    double kWorld = 0.35;
+                    double wvx = kWorld * errN;
+                    double wvy = kWorld * errE;
+                    double wvMag = std::hypot(wvx, wvy);
+                    double wMax = cfg_.maxVelXY * 0.35;
+                    if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
+                    double w = std::min(1.0, (sincePix - 0.5) / 2.0);  // 0→1 over 2s
+                    vx = vx * (1.0 - w) + wvx * w;
+                    vy = vy * (1.0 - w) + wvy * w;
+                }
+            }
+
+            double maxVel = cfg_.maxVelXY * 0.6;
             double vMag = std::hypot(vx, vy);
             if (vMag > maxVel && vMag > 0.001) {
                 vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
@@ -529,7 +549,7 @@ bool BombDropSystem::descendAndDrop() {
     const double DESCENT_RATE = 0.3;
     const double CONVERGE_TOL_PX = 15.0;
     const double STABLE_DURATION = 0.3;
-    const double MAX_MATCH_PX = 200.0;
+    const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;
     const double CONF_DECAY = 1.5;
     const double CONF_MIN = 0.40;
@@ -537,7 +557,7 @@ bool BombDropSystem::descendAndDrop() {
     bool reachedDropAlt = false;
     bool wasConverged = false;
     auto convergeStart = t0;
-    auto lastPixTime = t0;    // 继承 CENTER 收敛状态, 置信度=max
+    auto lastPixTime = t0 - seconds(10);    // 初始无像素, 立即激活世界坐标兜底
     char buf[256];
 
     while (true) {
@@ -586,7 +606,7 @@ bool BombDropSystem::descendAndDrop() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制: 像素→机体速度→NED (yaw旋转) ──
+        // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
         double vx = 0, vy = 0;
         if (confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
@@ -598,7 +618,27 @@ bool BombDropSystem::descendAndDrop() {
             double yawRad = initYaw_ * M_PI / 180.0;
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-            double maxVel = cfg_.maxVelXY * 0.5 * confidence;
+
+            // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
+            if (!hasPix && sincePix > 0.5) {
+                const auto& t = targetMap_[currentTargetIdx_].world;
+                double errN = t.north - ds.north;
+                double errE = t.east  - ds.east;
+                double distW = std::hypot(errN, errE);
+                if (distW > 0.3) {
+                    double kWorld = 0.35;
+                    double wvx = kWorld * errN;
+                    double wvy = kWorld * errE;
+                    double wvMag = std::hypot(wvx, wvy);
+                    double wMax = cfg_.maxVelXY * 0.35;
+                    if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
+                    double w = std::min(1.0, (sincePix - 0.5) / 2.0);
+                    vx = vx * (1.0 - w) + wvx * w;
+                    vy = vy * (1.0 - w) + wvy * w;
+                }
+            }
+
+            double maxVel = cfg_.maxVelXY * 0.5;
             double vMag = std::hypot(vx, vy);
             if (vMag > maxVel && vMag > 0.001) {
                 vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
