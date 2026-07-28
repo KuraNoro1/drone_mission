@@ -22,19 +22,10 @@ namespace {
     }
 }
 
-// 前向声明（从原代码保留）
-static bucketDetection selectTargetBucket(const multiBucketData& data, int priority, int lockedId = 0);
-static const char* bucketIdToLabel(int id);
-
 missionStateMachine::missionStateMachine(droneLink& link, const missionConfigData& config)
     : link_(link), config_(config), state_(missionState::init), running_(false),
-      initYaw_(0), missionPriority_(0), reconWpIndex_(0), dropSearchPhase_(0),
-      bucketFound_(false), hasLastTarget_(false), dropCount_(0),
-      dropZoneEnterTime_(steady_clock::now()),
-      stableDetectCount_(0), lastDetectTargetId_(0),
-      searchCooldownStart_(steady_clock::now()) {
-    lastMultiData_ = {0, {}};
-    lastTargetBucket_ = {0, 0, 0};
+      initYaw_(0), missionPriority_(0), reconWpIndex_(0), dropCount_(0),
+      dropZoneEnterTime_(steady_clock::now()) {
 }
 
 missionStateMachine::~missionStateMachine() { stop(); }
@@ -43,13 +34,6 @@ bool missionStateMachine::init() {
     flight_ = std::make_unique<flightOps>(link_);
     offboard_ = std::make_unique<offboardControl>(link_);
     servo_ = std::make_unique<servoControl>(link_);
-
-    pidN_ = std::make_unique<pidController>(
-        config_.visualServo.kp, config_.visualServo.ki, config_.visualServo.kd,
-        config_.visualServo.maxVelXY, 0.5);
-    pidE_ = std::make_unique<pidController>(
-        config_.visualServo.kp, config_.visualServo.ki, config_.visualServo.kd,
-        config_.visualServo.maxVelXY, 0.5);
 
     cmdPipe_ = std::make_unique<missionCmdPipe>(config_.vision.cmdPipePath);
     cmdPipe_->open();
@@ -66,9 +50,7 @@ bool missionStateMachine::init() {
         DropConfig dropCfg;
         const auto& vsCfg = config_.visualServo;
         dropCfg.searchAlt       = 3.5;
-        dropCfg.approachAlt     = dropCfg.searchAlt;  // 先飞到扫描高度（3.5m）保持视觉锁定
         dropCfg.dropAlt         = config_.flight.dropAlt;   // 从配置读取
-        dropCfg.gotoTimeout     = 10.0;
         dropCfg.stableDuration  = 0.3;
         dropCfg.velZeroTol      = vsCfg.velZeroTol;
         dropCfg.altTolerance    = vsCfg.altTolerance;
@@ -103,8 +85,17 @@ bool missionStateMachine::init() {
         " (" + (missionPriority_ == 1 ? "small bucket first" : "big bucket first") + ")");
 
     sleep_for(seconds(2));
-    initYaw_ = link_.headingDeg();
-    log("Initial heading locked: " + std::to_string(initYaw_) + " deg");
+    {
+        double measured = static_cast<double>(link_.headingDeg());
+        double ref = config_.yawCalibration.referenceHeading;
+        double error = measured - ref;
+        while (error > 180.0) error -= 360.0;
+        while (error < -180.0) error += 360.0;
+        initYaw_ = static_cast<float>(ref);
+        log("Yaw calibration: measured=" + std::to_string(measured).substr(0,5) +
+            " ref=" + std::to_string(ref) + " error=" + std::to_string(error).substr(0,5) +
+            " corrected=" + std::to_string(initYaw_).substr(0,5) + " deg");
+    }
 
     log("========================================");
     if (isatty(STDIN_FILENO)) {
@@ -157,16 +148,6 @@ const char* missionStateMachine::stateName(missionState s) const {
     }
 }
 
-const char* missionStateMachine::vsStateName(VisualServoState s) const {
-    switch (s) {
-        case VisualServoState::SEARCHING:  return "SEARCHING";
-        case VisualServoState::TRACKING:   return "TRACKING";
-        case VisualServoState::CONVERGED:  return "CONVERGED";
-        case VisualServoState::READY_DROP: return "READY_DROP";
-        default:                           return "???";
-    }
-}
-
 void missionStateMachine::notifyVision(const char* stateStr) {
     if (cmdPipe_) cmdPipe_->sendState(stateStr);
 }
@@ -180,7 +161,6 @@ void missionStateMachine::run() {
             case missionState::takeoff:         handleTakeoff();         break;
             case missionState::transitToDrop:   handleTransitToDrop();   break;
             case missionState::dropSearch:      handleDropSearch();      break;
-            case missionState::dropVisualServo: handleDropVisualServo(); break;
             case missionState::transitToRecon:  handleTransitToRecon();  break;
             case missionState::reconScan:       handleReconScan();       break;
             case missionState::rtl:             handleRtl();             break;
@@ -233,66 +213,10 @@ void missionStateMachine::handleTransitToDrop() {
     }
 
     dropZoneEnterTime_ = steady_clock::now();
-    dropSearchPhase_ = 0;
-    bucketFound_ = false;
-    hasLastTarget_ = false;
     dropCount_ = 0;
     droppedSides_.clear();
     bombSystem_->reset();
     setState(missionState::dropSearch);
-}
-
-// ── 挂载点像素投影（保留，但 BombDropSystem 内部已处理，此处可能不再使用） ──
-void missionStateMachine::computeMountPixels(double altitude,
-    double& uL, double& vL, double& uR, double& vR, double& radius) {
-    const double fx = config_.camera.fx, fy = config_.camera.fy;
-    const double cx = config_.camera.cx, cy = config_.camera.cy;
-    const double camDx = config_.camera.offsetForward, camDy = config_.camera.offsetRight;
-    const double mntLx = -0.07, mntLy =  0.001;
-    const double mntRx =  0.07, mntRy = -0.001;
-    const double worldR = 0.10;
-    if (altitude < 0.1) altitude = 0.1;
-    uL = cx + fx * (mntLx - camDx) / altitude;
-    vL = cy + fy * (mntLy - camDy) / altitude;
-    uR = cx + fx * (mntRx - camDx) / altitude;
-    vR = cy + fy * (mntRy - camDy) / altitude;
-    radius = worldR * fx / altitude;
-}
-
-// ── 根据优先级选择目标桶（保留，但 BombDropSystem 内部也有类似逻辑） ──
-static bucketDetection selectTargetBucket(const multiBucketData& data, int priority, int lockedId) {
-    if (data.empty()) return {0, 0, 0};
-    if (lockedId > 0) {
-        for (const auto& b : data.buckets) if (b.bucketId == lockedId) return b;
-        return {0, 0, 0};
-    }
-    if (priority == 1) {
-        for (const auto& b : data.buckets) if (b.bucketId == 1) return b;
-        for (const auto& b : data.buckets) if (b.bucketId == 2) return b;
-        for (const auto& b : data.buckets) if (b.bucketId == 3) return b;
-        return data.buckets[0];
-    } else {
-        for (const auto& b : data.buckets) if (b.bucketId == 3) return b;
-        for (const auto& b : data.buckets) if (b.bucketId == 2) return b;
-        for (const auto& b : data.buckets) if (b.bucketId == 1) return b;
-        return data.buckets[0];
-    }
-}
-
-static const char* bucketIdToLabel(int id) {
-    switch (id) {
-        case 1: return "15cm(桶1)";
-        case 2: return "20cm(桶2)";
-        case 3: return "25cm(桶3)";
-        default: return "未知";
-    }
-}
-
-// ── 等待视觉检测（保留，但 BombDropSystem 内部实现更完整，此处可能不再使用） ──
-bool missionStateMachine::waitForDetection(double timeoutSec, multiBucketData& outData) {
-    // 此函数在真机中用于早期逻辑，仿真中可保留但不被调用
-    log("[WAIT_DETECT] (deprecated)");
-    return false;
 }
 
 // ── 投放区：委托 BombDropSystem ──────────────────────────
@@ -378,31 +302,6 @@ void missionStateMachine::forceDropAll() {
         sleep_for(milliseconds(300));
     }
     log("[FORCE_DROP] All payloads released");
-}
-
-// ── 以下为未被调用的旧视觉伺服函数，保留但不使用 ──────────
-
-void missionStateMachine::gotoBucketFound(float wpN, float wpE, const bucketDetection& targetBucket) {
-    // 不再使用
-}
-
-bool missionStateMachine::flyToWithPipeCheck(float north, float east, float down, float yaw,
-    double distTol, double timeoutSec, const std::string& desc,
-    bool checkPipe, multiBucketData& outData) {
-    // 不再使用
-    return false;
-}
-
-void missionStateMachine::handleDropVisualServo() {
-    // 不再使用，直接跳到侦察
-    log("[VSERVO] Legacy path - redirecting to recon");
-    setState(missionState::transitToRecon);
-}
-
-int missionStateMachine::runVisualServoLoop(double /*targetAlt*/, double totalTimeout,
-    const bucketDetection& targetBucket, const visualServoConfig& vsCfg) {
-    // 不再使用
-    return 0;
 }
 
 // ── 侦察 → RTL → 降落 ─────────────────────────────────────

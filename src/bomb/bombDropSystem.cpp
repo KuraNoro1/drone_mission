@@ -243,6 +243,9 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
     log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m...");
 
+    int emptyFrames = 0;
+    const int EMPTY_TIMEOUT_FRAMES = 15;  // 1.5s连续无检测才清空聚类
+
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
         offboard_.setPositionNed(
@@ -251,8 +254,13 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
         multiBucketData vis;
         if (!bucketPipe_.readLatest(vis) || vis.empty()) {
-            clusters.clear(); sleep_for(milliseconds(100)); continue;
+            emptyFrames++;
+            if (emptyFrames >= EMPTY_TIMEOUT_FRAMES) {
+                clusters.clear(); emptyFrames = 0;
+            }
+            sleep_for(milliseconds(100)); continue;
         }
+        emptyFrames = 0;
 
         // 当前帧: 每个检测分配到最近簇
         std::set<int> matchedIds;
@@ -293,7 +301,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
                     if (v > bestV) { bestV = v; bestId = id; }
 
                 double alt = link_.altitude();
-                double yawRad = initYaw_ * M_PI / 180.0;
+                double yawRad = static_cast<double>(link_.headingDeg()) * M_PI / 180.0;
                 WorldTarget wt = pixelToWorld(cl.cx, cl.cy, 0, intrinsics_, extrinsics_,
                                                alt, 0, 0, yawRad, ned.northM, ned.eastM);
                 if (wt.valid) {
@@ -446,27 +454,23 @@ bool BombDropSystem::centerAboveTarget() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制 ──
+        // ── 水平控制: 像素→机体速度→NED (yaw旋转) ──
         double vx = 0, vy = 0;
-        if (hasPix || sincePix < 1.5) {  // 有像素或刚丢不久: 继续用旧像素 + 低置信度
-            // 若无当前像素, 用上一个已知像素 (pixCx/pixCy 保持上次值)
-            if (!hasPix && sincePix < 0.5) {
-                // 短暂丢失(管道空), 沿用上次像素位置, 置信度已衰减
-            } else if (!hasPix) {
-                confidence = 0;  // 太久无像素, 停控
-            }
-            if (confidence > 0.01) {
-                double errNormX = (pixCx - cx) / cx;
-                double errNormY = (pixCy - cy) / cy;
-                double errNy = errNormY * confidence;
-                double errNx = -errNormX * confidence;
-                vx = pidX_->update(errNy, 0.05) * confidence;
-                vy = pidY_->update(errNx, 0.05) * confidence;
-                double maxVel = cfg_.maxVelXY * 0.6 * confidence;
-                double vMag = std::hypot(vx, vy);
-                if (vMag > maxVel && vMag > 0.001) {
-                    vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
-                }
+        if (confidence > 0.01) {
+            // 机体坐标系速度: 像素上方=前, 像素左侧=左
+            double errU = (pixCx - cx) / cx;  // 像素水平误差 (列方向)
+            double errV = (pixCy - cy) / cy;  // 像素垂直误差 (行方向, 上方为负)
+            double bodyFwd = pidX_->update(-errV, 0.05);  // 像素上方 → 前
+            double bodyRgt = pidY_->update( errU, 0.05);  // 像素左侧 → 左 (机体Y负)
+            bodyFwd *= confidence;
+            bodyRgt *= confidence;
+            double yawRad = initYaw_ * M_PI / 180.0;
+            vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
+            vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
+            double maxVel = cfg_.maxVelXY * 0.6 * confidence;
+            double vMag = std::hypot(vx, vy);
+            if (vMag > maxVel && vMag > 0.001) {
+                vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
             }
         }
 
@@ -582,19 +586,22 @@ bool BombDropSystem::descendAndDrop() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制 ──
+        // ── 水平控制: 像素→机体速度→NED (yaw旋转) ──
         double vx = 0, vy = 0;
-        if (hasPix || sincePix < 1.5) {
-            if (confidence > 0.01) {
-                double errNormX = (pixCx - cx) / cx;
-                double errNormY = (pixCy - cy) / cy;
-                vx = pidX_->update(errNormY * confidence, 0.05) * confidence;
-                vy = pidY_->update(-errNormX * confidence, 0.05) * confidence;
-                double maxVel = cfg_.maxVelXY * 0.5 * confidence;
-                double vMag = std::hypot(vx, vy);
-                if (vMag > maxVel && vMag > 0.001) {
-                    vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
-                }
+        if (confidence > 0.01) {
+            double errU = (pixCx - cx) / cx;
+            double errV = (pixCy - cy) / cy;
+            double bodyFwd = pidX_->update(-errV, 0.05);
+            double bodyRgt = pidY_->update( errU, 0.05);
+            bodyFwd *= confidence;
+            bodyRgt *= confidence;
+            double yawRad = initYaw_ * M_PI / 180.0;
+            vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
+            vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
+            double maxVel = cfg_.maxVelXY * 0.5 * confidence;
+            double vMag = std::hypot(vx, vy);
+            if (vMag > maxVel && vMag > 0.001) {
+                vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
             }
         }
 

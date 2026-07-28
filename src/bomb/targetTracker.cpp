@@ -43,13 +43,20 @@ void TargetTracker::update(const multiBucketData& detections,
 
     elapsedTime_ = duration<double>(steady_clock::now() - t0_).count();
 
-    // 寻找锁定桶
+    // 空间邻近匹配：投影世界坐标→像素, 找最近的检测
     bucketDetection found{0, 0, 0};
     bool detected = false;
-    if (!detections.empty()) {
-        for (const auto& b : detections.buckets) {
-            if (b.bucketId == lockedBucketId_) {
-                found = b; detected = true; break;
+    if (!detections.empty() && track_.worldPos.valid) {
+        double expU, expV;
+        double yawRad = drone.yawDeg * M_PI / 180.0;
+        if (worldToPixel(track_.worldPos.north, track_.worldPos.east,
+                         intrinsics, extrinsics,
+                         drone.alt, 0, 0, yawRad,
+                         drone.north, drone.east, expU, expV)) {
+            double bestDist = 200.0;
+            for (const auto& b : detections.buckets) {
+                double d = std::hypot(b.cx - expU, b.cy - expV);
+                if (d < bestDist) { bestDist = d; found = b; detected = true; }
             }
         }
     }

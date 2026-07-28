@@ -84,7 +84,10 @@ struct landingConfig {
     int rtlTimeout;
 };
 
-// 新增相机配置
+struct yawCalibrationConfig {
+    double referenceHeading;
+};
+
 struct cameraConfig {
     double fx;
     double fy;
@@ -129,6 +132,7 @@ struct missionConfigData {
     servoConfig servo;
     landingConfig landing;
     cameraConfig camera;      // 新增
+    yawCalibrationConfig yawCalibration;
     int missionPriority;
 };
 

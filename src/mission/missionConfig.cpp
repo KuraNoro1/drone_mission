@@ -36,7 +36,8 @@ bool missionConfig::load() {
         parseVisualServo(loadFile("pid.yaml")["visualServo"]);
         parseVision(loadFile("vision.yaml")["vision"]);
         parseServo(loadFile("servo.yaml")["servo"]);
-        parseCamera(loadFile("camera.yaml")["camera"]);   // 新增
+        parseCamera(loadFile("camera.yaml")["camera"]);
+        parseYawCalibration(loadFile("yaw_calibration.yaml")["yaw_calibration"]);
         return true;
     } catch (const std::exception& e) {
         log("ERROR: Config parse failed: " + std::string(e.what()));
@@ -123,4 +124,8 @@ void missionConfig::parseCamera(const YAML::Node& node) {
     data_.camera.offsetForward = node["offsetForward"] ? node["offsetForward"].as<double>() : 0.15;
     data_.camera.offsetRight   = node["offsetRight"]   ? node["offsetRight"].as<double>()   : 0.0;
     data_.camera.offsetDown    = node["offsetDown"]    ? node["offsetDown"].as<double>()    : 0.0;
+}
+
+void missionConfig::parseYawCalibration(const YAML::Node& node) {
+    data_.yawCalibration.referenceHeading = node["reference_heading"] ? node["reference_heading"].as<double>() : 0.0;
 }

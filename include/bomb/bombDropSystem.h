@@ -15,9 +15,7 @@
 
 struct DropConfig {
     double searchAlt;       // 扫描高度 (m)
-    double approachAlt;     // 靠近目标高度 (m), position模式飞到该高度
     double dropAlt;         // 投弹高度 (m)
-    double gotoTimeout;     // goto 超时 (s)
     double stableDuration;  // 稳定持续时间 (s)
     double velZeroTol;      // 速度阈值 (m/s)
     double altTolerance;    // 高度容差 (m)
