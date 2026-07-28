@@ -50,20 +50,17 @@ public:
     int getDropCount() const { return dropCount_; }
 
 private:
-    enum class Phase { SCAN, SELECT, GOTO, TRACKING, PREDICT, CLIMB, DONE };
+    enum class Phase { SCAN, SELECT, CENTER, DESCEND, CLIMB, DONE };
 
     // ── 扫描 ──
-    bool scanForTargets(double timeoutSec);   // 高度使用 cfg_.searchAlt
+    bool scanForTargets(double timeoutSec);
     bool selectNextTarget();
 
-    // ── 导航到目标世界坐标 ──
-    bool gotoWorldTarget();
+    // ── 纯视觉对准 (同高度) ──
+    bool centerAboveTarget();
 
-    // ── 跟踪下降 (用TargetTracker容错状态机) ──
-    bool trackAndDescend();
-
-    // ── 落点预测 + 投弹 ──
-    bool predictAndDrop();
+    // ── 垂直下降 + 投弹 (纯视觉) ──
+    bool descendAndDrop();
 
     // ── 爬升 ──
     bool climbToSearchAlt();
@@ -73,8 +70,6 @@ private:
 
     // ── 飞回扫描原点 ──
     bool flyToScanOrigin();
-
-    bool lastHasPix_;   // 记录上一帧是否有像素，用于视觉丢失时重置PID
 
     droneLink& link_;
     offboardControl& offboard_;
@@ -108,4 +103,5 @@ private:
     // 扫描原点 (第一次 SCAN 时记录)
     double scanOriginN_;
     double scanOriginE_;
+    bool lastHasPix_;
 };

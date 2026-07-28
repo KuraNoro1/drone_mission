@@ -52,5 +52,14 @@ WorldTarget pixelToWorld(double u, double v, double radiusPx,
                          const CameraIntrinsics& intrinsics,
                          const CameraExtrinsics& extrinsics,
                          double altitude,
-                         double roll, double pitch, double yaw,
-                         double droneNorth, double droneEast);
+                          double roll, double pitch, double yaw,
+                          double droneNorth, double droneEast);
+
+// ── 逆映射：世界坐标 → 像素坐标 ───────────────────────────
+// 返回false表示投影点在相机后方（不可见）
+bool worldToPixel(double worldN, double worldE,
+                  const CameraIntrinsics& intrinsics,
+                  const CameraExtrinsics& extrinsics,
+                  double altitude, double roll, double pitch, double yaw,
+                  double droneNorth, double droneEast,
+                  double& u, double& v);

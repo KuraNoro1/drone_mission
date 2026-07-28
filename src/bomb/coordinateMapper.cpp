@@ -130,3 +130,47 @@ WorldTarget pixelToWorld(double u, double v, double radiusPx,
 
     return result;
 }
+
+// ── 世界坐标 → 像素坐标 ────────────────────────────────────
+
+bool worldToPixel(double worldN, double worldE,
+                  const CameraIntrinsics& intrinsics,
+                  const CameraExtrinsics& extrinsics,
+                  double altitude, double roll, double pitch, double yaw,
+                  double droneNorth, double droneEast,
+                  double& u, double& v) {
+    if (altitude < 0.1) altitude = 0.1;
+
+    Matrix33 R_b2n = eulerToRotation(roll, pitch, yaw);
+    Vector3 camOffsetBody = {extrinsics.offsetForward,
+                             extrinsics.offsetRight,
+                             extrinsics.offsetDown};
+    Vector3 camOffsetNed = matVecMul(R_b2n, camOffsetBody);
+
+    double camZ = -altitude + camOffsetNed.z;
+
+    double dN = worldN - droneNorth - camOffsetNed.x;
+    double dE = worldE - droneEast  - camOffsetNed.y;
+    double dD = 0.0 - camZ;
+
+    double cy = std::cos(yaw), sy = std::sin(yaw);
+    double cp = std::cos(pitch), sp = std::sin(pitch);
+    double cr = std::cos(roll), sr = std::sin(roll);
+
+    double bod_x = cy*cp*dN + sy*cp*dE - sp*dD;
+    double bod_y = (cy*sp*sr - sy*cr)*dN + (sy*sp*sr + cy*cr)*dE + cp*sr*dD;
+    double bod_z = (cy*sp*cr + sy*sr)*dN + (sy*sp*cr - cy*sr)*dE + cp*cr*dD;
+
+    double cam_x = bod_y;
+    double cam_y = bod_x;
+    double cam_z = bod_z;
+
+    if (cam_z <= 0) return false;
+
+    double xn = cam_x / cam_z;
+    double yn = cam_y / cam_z;
+
+    u = xn * intrinsics.fx + intrinsics.cx;
+    v = yn * intrinsics.fy + intrinsics.cy;
+    return true;
+}
