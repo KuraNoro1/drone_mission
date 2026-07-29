@@ -241,10 +241,27 @@ void missionStateMachine::handleTransitToDrop() {
     }
 
     auto t0 = steady_clock::now();
-    double transitTime = 15.0;
+    const double TRANSIT_TIMEOUT = 25.0;
+    const double DIST_TOL = 1.0;
+    const double ALT_TOL = 0.5;
+
     while (running_ && link_.isConnected() &&
-           duration<double>(steady_clock::now() - t0).count() < transitTime) {
+           duration<double>(steady_clock::now() - t0).count() < TRANSIT_TIMEOUT) {
         offboard_->setPositionNed(dropTargetN_, dropTargetE_, -alt, initYaw_);
+
+        auto ned = link_.nedPosition();
+        double distToTarget = std::hypot(ned.northM - dropTargetN_, ned.eastM - dropTargetE_);
+        if (distToTarget < DIST_TOL && std::abs(link_.altitude() - alt) < ALT_TOL) {
+            log("[TRANSIT] Arrived drop zone: dist=" +
+                std::to_string(distToTarget).substr(0,4) + "m alt=" +
+                std::to_string(link_.altitude()).substr(0,3) + "m");
+            break;
+        }
+
+        static int cnt = 0;
+        if (++cnt % 10 == 1) {
+            log("  [TRANSIT] distToDrop=" + std::to_string(distToTarget).substr(0,4) + "m");
+        }
         sleep_for(milliseconds(200));
     }
 
@@ -391,7 +408,7 @@ void missionStateMachine::handleDropSearch() {
 
     auto ned = link_.nedPosition();
     double distFromTarget = std::hypot(ned.northM - dropTargetN_, ned.eastM - dropTargetE_);
-    if (distFromTarget > 5.0) {
+    if (distFromTarget > 3.0) {
         log("[DROP] Not yet at drop zone (dist=" + std::to_string((int)distFromTarget) + "m), waiting...");
         sleep_for(milliseconds(100));
         return;
@@ -1080,12 +1097,30 @@ void missionStateMachine::handleTransitToRecon() {
 
     log("[RECON] Flying to recon zone at " + std::to_string(cruiseAlt) + "m");
     auto t0 = steady_clock::now();
-    double transitTime = 12.0;
+    const double TRANSIT_TIMEOUT = 25.0;
+    const double DIST_TOL = 3.0;
+    const double ALT_TOL = 1.0;
+
     while (running_ && link_.isConnected() &&
-           duration<double>(steady_clock::now() - t0).count() < transitTime) {
+           duration<double>(steady_clock::now() - t0).count() < TRANSIT_TIMEOUT) {
         offboard_->setPositionNed(reconOriginN_, reconOriginE_, -cruiseAlt, initYaw_);
-        sleep_for(milliseconds(500));
+
+        auto ned = link_.nedPosition();
+        double distToTarget = std::hypot(ned.northM - reconOriginN_, ned.eastM - reconOriginE_);
+        if (distToTarget < DIST_TOL && std::abs(link_.altitude() - cruiseAlt) < ALT_TOL) {
+            log("[RECON] Arrived recon zone: dist=" +
+                std::to_string(distToTarget).substr(0,4) + "m alt=" +
+                std::to_string(link_.altitude()).substr(0,3) + "m");
+            break;
+        }
+
+        static int cnt = 0;
+        if (++cnt % 10 == 1) {
+            log("  [RECON] distToRecon=" + std::to_string(distToTarget).substr(0,4) + "m");
+        }
+        sleep_for(milliseconds(200));
     }
+
     reconWpIndex_ = 0;
     setState(missionState::reconScan);
 }

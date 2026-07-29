@@ -133,16 +133,16 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 
 ### `src/mission/missionStateMachine.cpp`
 
-**关键函数**: `handleDropSearch()`
+**关键函数**: `handleDropSearch()`, `handleTransitToDrop()`, `handleTransitToRecon()`
 
 ```cpp
-// 流控:
-1. 位置模式悬停 3.5m
-2. 28m 距离滤波
-3. 90s 超时检查
-4. bombSystem_->execute()
-5. 结果处理: 稳定爬升 + 强制投弹补齐
-6. → transitToRecon
+// handleTransitToDrop():
+// 位置模式飞到投放区中心, 距离<1m + 高度<0.5m 后进入 DROP_SEARCH
+// 超时 25s
+
+// handleTransitToRecon():
+// 位置模式飞到侦察区中心, 距离<3m + 高度<1m 后进入 RECON_SCAN
+// 超时 25s
 
 // 审查要点:
 // 1. bombSystem 超时后是否正确处理
@@ -153,8 +153,8 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 **关键函数**: `handleTransitToRecon()`
 
 ```cpp
+// 位置模式飞到侦察区中心, 到达条件: 水平<3m + 高度<1m, 超时30s
 // 不再做 stop/restart, 直接切换目标坐标
-// 前提: handleDropSearch 已稳定在 searchAlt (3.5m)
 // 审查: isActive() 检查防止重复 start
 ```
 

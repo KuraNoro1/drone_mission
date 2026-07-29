@@ -17,9 +17,9 @@ INIT → ARMING → TAKEOFF → TRANSIT_TO_DROP → DROP_SEARCH → TRANSIT_TO_R
 |------|----------|----------|
 | `arming` | `handleArming()` | `flight_->arm()` → TAKEOFF |
 | `takeoff` | `handleTakeoff()` | `flight_->takeoff(3m)` → TRANSIT_TO_DROP |
-| `transitToDrop` | `handleTransitToDrop()` | 位置模式飞往投放区中心 15s，高度 3m。重置投放区相关状态，包括 `bombSystem_->reset()` → DROP_SEARCH |
+| `transitToDrop` | `handleTransitToDrop()` | 位置模式飞往投放区中心，到达条件: 水平 <1m + 高度 <0.5m，超时 25s。重置投放区相关状态，包括 `bombSystem_->reset()` → DROP_SEARCH |
 | `dropSearch` | `handleDropSearch()` | **见第二节** |
-| `transitToRecon` | `handleTransitToRecon()` | 位置模式飞往侦察区 12s |
+| `transitToRecon` | `handleTransitToRecon()` | 位置模式飞往侦察区，到达条件: 水平 <3m + 高度 <1m，超时 25s |
 | `reconScan` | `handleReconScan()` | 5航点，每点悬停 3s 检查 H pipe |
 | `rtl` | `handleRtl()` | 返航 4m 25s, 降落 |
 | `error` | (run()内) | stop offboard, RTL |
@@ -163,8 +163,8 @@ commit 后:
 ```
 t=0      进入 DROP_SEARCH
 t=0-8s   SCAN: 悬停扫描 + 建图
-t=8s     选目标 → GOTO position模式 2.5m
-t=15s    GOTO到达 → CENTER velocity模式 2.5m (像素伺服)
+t=8s     选目标 → GOTO position模式 2.5m (到达条件: 水平<0.5m)
+t≈12s    GOTO到达 → CENTER velocity模式 2.5m (像素伺服)
 t=20s    CENTER 收敛 → DESCEND 开始下降
 t=23s    降至 1.8m, 五条件满足 → 投弹
 t=24s    CLIMB 爬升至 3.5m
