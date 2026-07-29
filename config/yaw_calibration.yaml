@@ -3,4 +3,4 @@
 # reference_heading 为该方向在地理坐标系中的标准航向角
 # 系统将自动计算 yaw_error = measured - reference, 并修正 initYaw_
 yaw_calibration:
-  reference_heading: 188       # 标准航向角 (deg, 0=正北)
+  reference_heading: 180       # 标准航向角 (deg, 0=正北)
