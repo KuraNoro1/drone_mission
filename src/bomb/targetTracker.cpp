@@ -49,9 +49,11 @@ void TargetTracker::update(const multiBucketData& detections,
     if (!detections.empty() && track_.worldPos.valid) {
         double expU, expV;
         double yawRad = drone.yawDeg * M_PI / 180.0;
+        double rollRad = drone.rollDeg * M_PI / 180.0;
+        double pitchRad = drone.pitchDeg * M_PI / 180.0;
         if (worldToPixel(track_.worldPos.north, track_.worldPos.east,
                          intrinsics, extrinsics,
-                         drone.alt, 0, 0, yawRad,
+                         drone.alt, rollRad, pitchRad, yawRad,
                          drone.north, drone.east, expU, expV)) {
             double bestDist = 200.0;
             for (const auto& b : detections.buckets) {
@@ -67,9 +69,11 @@ void TargetTracker::update(const multiBucketData& detections,
     if (detected) {
         // 将像素坐标转换为世界坐标
         double yawRad = drone.yawDeg * M_PI / 180.0;
+        double rollRad = drone.rollDeg * M_PI / 180.0;
+        double pitchRad = drone.pitchDeg * M_PI / 180.0;
         WorldTarget raw = pixelToWorld(found.cx, found.cy, 0,
                                         intrinsics, extrinsics,
-                                        drone.alt, 0, 0, yawRad,
+                                        drone.alt, rollRad, pitchRad, yawRad,
                                         drone.north, drone.east);
 
         if (raw.valid) {

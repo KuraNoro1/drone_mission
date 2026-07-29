@@ -50,6 +50,7 @@ DroneState BombDropSystem::getDroneState() const {
     auto ned = link_.nedPosition();
     auto vel = link_.nedVelocity();
     return {ned.northM, ned.eastM, link_.altitude(), correctedYawDeg(),
+            link_.attitudeRollDeg(), link_.attitudePitchDeg(),
             vel.northM, vel.eastM};
 }
 
@@ -144,19 +145,16 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
             case Phase::SELECT:
                 if (!selectNextTarget()) {
                     log("All mapped targets exhausted, re-scanning...");
-                    // 飞回扫描原点（3.5m）
                     if (!flyToScanOrigin()) {
                         log("Failed to return to scan origin, abort");
                         result.timedOut = true;
                         return result;
                     }
-                    // 临时将搜索高度改为 4.0m (第一次高度 +0.5m)
                     double originalSearchAlt = cfg_.searchAlt;
                     double newSearchAlt = originalSearchAlt + 0.5;
                     cfg_.searchAlt = newSearchAlt;
                     log("Temporary re-scan height set to " + std::to_string(newSearchAlt) + "m");
 
-                    // 爬升至新高度（当前位置已位于原点，但高度为 originalSearchAlt）
                     auto ned = link_.nedPosition();
                     offboard_.stop(); sleep_for(milliseconds(300));
                     if (!offboard_.startPositionModeAt(static_cast<float>(ned.northM),
@@ -164,11 +162,10 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                                                        static_cast<float>(-newSearchAlt),
                                                        initYaw_)) {
                         log("Failed to climb for re-scan");
-                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        cfg_.searchAlt = originalSearchAlt;
                         result.timedOut = true;
                         return result;
                     }
-                    // 等待到达目标高度
                     auto tClimb = steady_clock::now();
                     while (duration<double>(steady_clock::now() - tClimb).count() < 10.0) {
                         offboard_.setPositionNed(static_cast<float>(ned.northM),
@@ -180,14 +177,12 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                         sleep_for(milliseconds(200));
                     }
 
-                    // 二次扫描 8 秒 (内部使用 cfg_.searchAlt，现已临时改为 newSearchAlt)
                     if (!scanForTargets(8.0)) {
                         log("Re-scan found nothing, abort");
-                        cfg_.searchAlt = originalSearchAlt; // 恢复
+                        cfg_.searchAlt = originalSearchAlt;
                         result.timedOut = true;
                         return result;
                     }
-                    // 恢复原搜索高度
                     cfg_.searchAlt = originalSearchAlt;
 
                     if (!selectNextTarget()) {
@@ -196,7 +191,16 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                         return result;
                     }
                 }
-                phase_ = Phase::CENTER;
+                phase_ = Phase::GOTO;
+                break;
+            case Phase::GOTO:
+                if (!gotoWorldTarget()) {
+                    log("GOTO: failed, next target");
+                    targetMap_[currentTargetIdx_].used = true;
+                    phase_ = Phase::SELECT;
+                } else {
+                    phase_ = Phase::CENTER;
+                }
                 break;
             case Phase::CENTER:
                 if (!centerAboveTarget()) {
@@ -308,8 +312,10 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
                 double alt = link_.altitude();
                 double yawRad = correctedYawDeg() * M_PI / 180.0;
+                double rollRad = link_.attitudeRollDeg() * M_PI / 180.0;
+                double pitchRad = link_.attitudePitchDeg() * M_PI / 180.0;
                 WorldTarget wt = pixelToWorld(cl.cx, cl.cy, 0, intrinsics_, extrinsics_,
-                                               alt, 0, 0, yawRad, ned.northM, ned.eastM);
+                                               alt, rollRad, pitchRad, yawRad, ned.northM, ned.eastM);
                 if (wt.valid) {
                     // 坐标边界检查: 相对于扫描时无人机位置, 限制在±20m范围内
                     double maxRange = 20.0;
@@ -366,12 +372,69 @@ bool BombDropSystem::selectNextTarget() {
     return false;
 }
 
+// ── GOTO: 位置模式粗逼近 ──────────────────────────────────
+
+bool BombDropSystem::gotoWorldTarget() {
+    const auto& target = targetMap_[currentTargetIdx_];
+    double approachAlt = cfg_.approachAlt;
+    log("GOTO: 桶" + std::string(bucketLabel(target.bucketId)) +
+        " @world(" + std::to_string(target.world.north).substr(0,5) + "," +
+        std::to_string(target.world.east).substr(0,5) + ") at " +
+        std::to_string(approachAlt) + "m");
+
+    offboard_.stop();
+    sleep_for(milliseconds(300));
+
+    if (!offboard_.startPositionModeAt(
+            static_cast<float>(target.world.north),
+            static_cast<float>(target.world.east),
+            static_cast<float>(-approachAlt),
+            initYaw_)) {
+        log("GOTO: Failed to start position mode");
+        return false;
+    }
+
+    auto t0 = steady_clock::now();
+    const double GOTO_TIMEOUT = 15.0;
+    const double DIST_TOL = 0.5;
+    const double ALT_TOL = 0.4;
+
+    while (duration<double>(steady_clock::now() - t0).count() < GOTO_TIMEOUT) {
+        offboard_.setPositionNed(
+            static_cast<float>(target.world.north),
+            static_cast<float>(target.world.east),
+            static_cast<float>(-approachAlt),
+            initYaw_);
+
+        auto ned = link_.nedPosition();
+        double dist = std::hypot(ned.northM - target.world.north,
+                                 ned.eastM  - target.world.east);
+        double alt = link_.altitude();
+
+        if (dist < DIST_TOL && std::abs(alt - approachAlt) < ALT_TOL) {
+            log("GOTO: arrived dist=" + std::to_string(dist).substr(0,4) +
+                "m alt=" + std::to_string(alt).substr(0,3) + "m");
+            return true;
+        }
+
+        static int cnt = 0;
+        if (++cnt % 10 == 1) {
+            log("  [GOTO] dist=" + std::to_string(dist).substr(0,4) +
+                "m alt=" + std::to_string(alt).substr(0,3) + "m");
+        }
+        sleep_for(milliseconds(200));
+    }
+
+    log("GOTO: timeout");
+    return false;
+}
+
 // ── CENTER: 纯像素视觉对准 (同高度, 对准后再下降) ──────────
 
 bool BombDropSystem::centerAboveTarget() {
     const auto& target = targetMap_[currentTargetIdx_];
     log("CENTER: centering above 桶" + std::string(bucketLabel(target.bucketId)) +
-        " at " + std::to_string(cfg_.searchAlt) + "m  world(" +
+        " at " + std::to_string(cfg_.approachAlt) + "m  world(" +
         std::to_string(target.world.north).substr(0,4) + "," +
         std::to_string(target.world.east).substr(0,4) + ")");
 
@@ -402,13 +465,13 @@ bool BombDropSystem::centerAboveTarget() {
     const double CONVERGE_TOL_PX = 15.0;
     const double STABLE_DURATION = 0.6;
     const double MAX_MATCH_PX = 350.0;
-    const double CONF_HIGH = 0.20;    // 置信度保持1.0的时长 (s)
-    const double CONF_DECAY = 1.5;    // 置信度从1.0衰减到min的时长 (s)
-    const double CONF_MIN = 0.40;     // 最低置信度 (保证始终有弱控制)
+    const double CONF_HIGH = 0.20;
+    const double CONF_DECAY = 1.5;
+    const double CONF_MIN = 0.40;
 
     bool wasConverged = false;
     auto convergeStart = t0;
-    auto lastPixTime = t0 - seconds(10);    // 初始无像素, 立即激活世界坐标兜底
+    auto lastPixTime = t0;
     char buf[256];
 
     while (true) {
@@ -429,14 +492,16 @@ bool BombDropSystem::centerAboveTarget() {
         if (!vis.empty()) {
             double expU = cx, expV = cy;
             double yawRad = correctedYawDeg() * M_PI / 180.0;
+            double rollRad = ds.rollDeg * M_PI / 180.0;
+            double pitchRad = ds.pitchDeg * M_PI / 180.0;
             WorldTarget wt = tracker_->getWorldTarget();
             if (wt.valid)
                 worldToPixel(wt.north, wt.east, intrinsics_, extrinsics_,
-                             ds.alt, 0, 0, yawRad, ds.north, ds.east, expU, expV);
+                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
             else
                 worldToPixel(target.world.north, target.world.east,
                              intrinsics_, extrinsics_,
-                             ds.alt, 0, 0, yawRad, ds.north, ds.east, expU, expV);
+                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
 
             double bestDist = MAX_MATCH_PX;
             for (const auto& b : vis.buckets) {
@@ -460,10 +525,9 @@ bool BombDropSystem::centerAboveTarget() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
+    // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
         double vx = 0, vy = 0;
-        if (confidence > 0.01) {
-            // 机体坐标系速度: 像素上方=前, 像素左侧=左
+        if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
             double errV = (pixCy - cy) / cy;
             double bodyFwd = pidX_->update(-errV, 0.05);
@@ -473,34 +537,33 @@ bool BombDropSystem::centerAboveTarget() {
             double yawRad = correctedYawDeg() * M_PI / 180.0;
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-
-            // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
-            if (!hasPix && sincePix > 0.5) {
-                const auto& t = targetMap_[currentTargetIdx_].world;
-                double errN = t.north - ds.north;
-                double errE = t.east  - ds.east;
-                double distW = std::hypot(errN, errE);
-                if (distW > 0.3) {
-                    double kWorld = 0.35;
-                    double wvx = kWorld * errN;
-                    double wvy = kWorld * errE;
-                    double wvMag = std::hypot(wvx, wvy);
-                    double wMax = cfg_.maxVelXY * 0.35;
-                    if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
-                    double w = std::min(1.0, (sincePix - 0.5) / 2.0);  // 0→1 over 2s
-                    vx = vx * (1.0 - w) + wvx * w;
-                    vy = vy * (1.0 - w) + wvy * w;
-                }
-            }
-
-            double maxVel = cfg_.maxVelXY * 0.6;
-            double vMag = std::hypot(vx, vy);
-            if (vMag > maxVel && vMag > 0.001) {
-                vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
+        }
+        // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
+        if (!hasPix && sincePix > 0.5) {
+            const auto& t = targetMap_[currentTargetIdx_].world;
+            double errN = t.north - ds.north;
+            double errE = t.east  - ds.east;
+            double distW = std::hypot(errN, errE);
+            if (distW > 0.3) {
+                double kWorld = 0.35;
+                double wvx = kWorld * errN;
+                double wvy = kWorld * errE;
+                double wvMag = std::hypot(wvx, wvy);
+                double wMax = cfg_.maxVelXY * 0.35;
+                if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
+                double w = std::min(1.0, (sincePix - 0.5) / 2.0);
+                vx = vx * (1.0 - w) + wvx * w;
+                vy = vy * (1.0 - w) + wvy * w;
             }
         }
 
-        double vz = cfg_.kpZ * (ds.alt - cfg_.searchAlt);
+        double maxVel = cfg_.maxVelXY * 0.6;
+        double vMag = std::hypot(vx, vy);
+        if (vMag > maxVel && vMag > 0.001) {
+            vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
+        }
+
+        double vz = cfg_.kpZ * (ds.alt - cfg_.approachAlt);
         vz = std::max(-cfg_.maxVelZ, std::min(cfg_.maxVelZ, vz));
 
         offboard_.setVelocityNed(static_cast<float>(vx), static_cast<float>(vy),
@@ -544,10 +607,9 @@ bool BombDropSystem::centerAboveTarget() {
 bool BombDropSystem::descendAndDrop() {
     const auto& target = targetMap_[currentTargetIdx_];
     log("DESCEND: 桶" + std::string(bucketLabel(target.bucketId)) +
-        " from " + std::to_string(cfg_.searchAlt) + "m to " +
+        " from " + std::to_string(cfg_.approachAlt) + "m to " +
         std::to_string(cfg_.dropAlt) + "m  (PID continuous from CENTER)");
 
-    // 不清零 PID — 继承 CENTER 阶段的积分补偿
     double cx = intrinsics_.cx, cy = intrinsics_.cy;
     auto t0 = steady_clock::now();
     const double DESCEND_TIMEOUT = 60.0;
@@ -563,7 +625,7 @@ bool BombDropSystem::descendAndDrop() {
     bool reachedDropAlt = false;
     bool wasConverged = false;
     auto convergeStart = t0;
-    auto lastPixTime = t0 - seconds(10);    // 初始无像素, 立即激活世界坐标兜底
+    auto lastPixTime = t0;
     char buf[256];
 
     while (true) {
@@ -583,14 +645,16 @@ bool BombDropSystem::descendAndDrop() {
         if (!vis.empty()) {
             double expU = cx, expV = cy;
             double yawRad = correctedYawDeg() * M_PI / 180.0;
+            double rollRad = ds.rollDeg * M_PI / 180.0;
+            double pitchRad = ds.pitchDeg * M_PI / 180.0;
             WorldTarget wt = tracker_->getWorldTarget();
             if (wt.valid)
                 worldToPixel(wt.north, wt.east, intrinsics_, extrinsics_,
-                             ds.alt, 0, 0, yawRad, ds.north, ds.east, expU, expV);
+                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
             else
                 worldToPixel(target.world.north, target.world.east,
                              intrinsics_, extrinsics_,
-                             ds.alt, 0, 0, yawRad, ds.north, ds.east, expU, expV);
+                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
 
             double bestDist = MAX_MATCH_PX;
             for (const auto& b : vis.buckets) {
@@ -614,7 +678,7 @@ bool BombDropSystem::descendAndDrop() {
 
         // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
         double vx = 0, vy = 0;
-        if (confidence > 0.01) {
+        if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
             double errV = (pixCy - cy) / cy;
             double bodyFwd = pidX_->update(-errV, 0.05);
@@ -624,31 +688,30 @@ bool BombDropSystem::descendAndDrop() {
             double yawRad = correctedYawDeg() * M_PI / 180.0;
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-
-            // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
-            if (!hasPix && sincePix > 0.5) {
-                const auto& t = targetMap_[currentTargetIdx_].world;
-                double errN = t.north - ds.north;
-                double errE = t.east  - ds.east;
-                double distW = std::hypot(errN, errE);
-                if (distW > 0.3) {
-                    double kWorld = 0.35;
-                    double wvx = kWorld * errN;
-                    double wvy = kWorld * errE;
-                    double wvMag = std::hypot(wvx, wvy);
-                    double wMax = cfg_.maxVelXY * 0.35;
-                    if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
-                    double w = std::min(1.0, (sincePix - 0.5) / 2.0);
-                    vx = vx * (1.0 - w) + wvx * w;
-                    vy = vy * (1.0 - w) + wvy * w;
-                }
+        }
+        // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
+        if (!hasPix && sincePix > 0.5) {
+            const auto& t = targetMap_[currentTargetIdx_].world;
+            double errN = t.north - ds.north;
+            double errE = t.east  - ds.east;
+            double distW = std::hypot(errN, errE);
+            if (distW > 0.3) {
+                double kWorld = 0.35;
+                double wvx = kWorld * errN;
+                double wvy = kWorld * errE;
+                double wvMag = std::hypot(wvx, wvy);
+                double wMax = cfg_.maxVelXY * 0.35;
+                if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
+                double w = std::min(1.0, (sincePix - 0.5) / 2.0);
+                vx = vx * (1.0 - w) + wvx * w;
+                vy = vy * (1.0 - w) + wvy * w;
             }
+        }
 
-            double maxVel = cfg_.maxVelXY * 0.5;
-            double vMag = std::hypot(vx, vy);
-            if (vMag > maxVel && vMag > 0.001) {
-                vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
-            }
+        double maxVel = cfg_.maxVelXY * 0.5;
+        double vMag = std::hypot(vx, vy);
+        if (vMag > maxVel && vMag > 0.001) {
+            vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
         }
 
         // ── 垂直控制 ──

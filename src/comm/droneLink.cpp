@@ -26,7 +26,7 @@ namespace {
 
 droneLink::droneLink(const std::string& url, double heartbeatTimeout)
     : url_(url), heartbeatTimeout_(heartbeatTimeout), connected_(false),
-      latestDistanceM_(-1), altPipeFd_(-1) {}
+      latestDistanceM_(-1), latestRollDeg_(0), latestPitchDeg_(0), altPipeFd_(-1) {}
 
 droneLink::~droneLink() {
     if (altPipeFd_ >= 0) { ::close(altPipeFd_); altPipeFd_ = -1; }
@@ -57,6 +57,7 @@ bool droneLink::connect() {
     telemetry_->set_rate_position(10.0);
     telemetry_->set_rate_position_velocity_ned(10.0);
     telemetry_->set_rate_distance_sensor(5.0);
+    telemetry_->set_rate_attitude_euler(10.0);
 
     auto [ok, gpsOriginRaw] = telemetry_->get_gps_global_origin();
     if (ok != Telemetry::Result::Success) {
@@ -68,6 +69,11 @@ bool droneLink::connect() {
 
     telemetry_->subscribe_distance_sensor([this](Telemetry::DistanceSensor ds) {
         latestDistanceM_ = ds.current_distance_m;
+    });
+
+    telemetry_->subscribe_attitude_euler([this](Telemetry::EulerAngle euler) {
+        latestRollDeg_  = euler.roll_deg;
+        latestPitchDeg_ = euler.pitch_deg;
     });
 
     if (altPipeFd_ >= 0) {
@@ -124,6 +130,10 @@ bool droneLink::inAir() const { return telemetry_->in_air(); }
 bool droneLink::armed() const { return telemetry_->armed(); }
 
 float droneLink::headingDeg() const { return telemetry_->heading().heading_deg; }
+
+float droneLink::attitudeRollDeg() const { return latestRollDeg_; }
+
+float droneLink::attitudePitchDeg() const { return latestPitchDeg_; }
 
 nedCoord droneLink::nedPosition() const {
     auto pvn = telemetry_->position_velocity_ned();

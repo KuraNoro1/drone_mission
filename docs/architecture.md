@@ -62,7 +62,7 @@
 └─────────────┬────────────────────────────────────┘
               │ (投放阶段委派)
 ┌──── BombDropSystem ──────────────────────────────┐
-│  SCAN → SELECT → GOTO → TRACKING → PREDICT →     │
+│  SCAN → SELECT → GOTO → CENTER → DESCEND →       │
 │  DROP → CLIMB                                     │
 │                                                   │
 │  使用: TargetTracker / CoordinateMapper / PID     │
@@ -72,6 +72,8 @@
    (Kalman +       (像素→世界)
     状态机)
 ```
+
+(BombDropSystem 实际阶段: SCAN → SELECT → GOTO → CENTER → DESCEND → DROP → CLIMB)
 
 ---
 
@@ -112,7 +114,8 @@ YOLO检测 → /tmp/vision_pipe → multiBucketPipe::readLatest()
                                       │
     ┌─────────────────────────────────┘
     │  SCAN阶段: 像素聚类 → pixelToWorld() → 目标地图
-    │  TRACKING阶段: TargetTracker.update() → Kalman预测/更新
+    │  CENTER阶段: 像素伺服 → pixErr → body velocity
+    │  DESCEND阶段: 像素伺服 + 世界坐标fallback → 下降至1.8m投弹
     │
     ├── Pixel PID (未commit): errPx → pidX/pidY → vx,vy
     └── World PID (已commit): errN,errE → pidX/pidY → vx,vy
@@ -151,8 +154,8 @@ count=0 时只有 1 字节
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | 搜索高度 | 3.5m | SCAN 阶段悬停高度 |
-| 靠近高度 | 1.4m | GOTO 位置模式飞到目标上方高度 |
-| 投弹高度 | 1.0m | PID 最终下降目标高度 |
+| 粗逼近高度 | 2.5m | GOTO 位置模式飞到目标上方高度 |
+| 投弹高度 | 1.8m | DESCEND 最终下降目标高度 |
 | 投弹区超时 | 90s | 进入投放区总时限 |
 | Kalman 过程噪声 | 0.01 m²/s | Q |
 | Kalman 观测噪声 | 0.05 m² | R |
@@ -181,7 +184,7 @@ count=0 时只有 1 字节
 机体: 前(North), 右(East), 下(Down)
 
 像素→世界映射流程:
-  像素(u,v) → 归一化(xn,yn) → 相机系射线 → 机体系(旋转) → NED系 → 地平面求交
+  像素(u,v) → 归一化(xn,yn) → 相机系射线 → 机体系(旋转) → NED系(含roll/pitch/yaw) → 地平面求交
 ```
 
 ---

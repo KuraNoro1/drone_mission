@@ -40,9 +40,9 @@ MAVSDK 唯一所有者。所有飞控操作封装在此。
 ### 第七步：投放系统 `include/bomb/bombDropSystem.h` → `src/bomb/bombDropSystem.cpp`
 **投放阶段完整逻辑**。
 - `scanForTargets()` — 像素聚类建图 (50px 半径)
-- `gotoWorldTarget()` — 位置模式飞到目标 1.4m
-- `trackAndDescend()` — velocity 模式 PID + REACQUIRE 恢复
-- `predictAndDrop()` — 五条件投弹 + 落点预测
+- `gotoWorldTarget()` — 位置模式飞到目标上方 2.5m
+- `centerAboveTarget()` — velocity 模式像素伺服
+- `descendAndDrop()` — 下降至 1.8m + 投弹
 
 ### 第八步：顶层状态机 `include/mission/missionStateMachine.h` → `src/mission/missionStateMachine.cpp`
 任务编排层。
@@ -87,11 +87,14 @@ MAVSDK 唯一所有者。所有飞控操作封装在此。
 
 ## 新增特性 (v3)
 
-- **BombDropSystem**: 分层投放架构，SCAN→SELECT→GOTO→TRACKING→PREDICT→CLIMB
+- **BombDropSystem**: 分层投放架构，SCAN→SELECT→GOTO→CENTER→DESCEND→DROP→CLIMB
+- **GOTO 粗逼近**: 位置模式飞到目标上方 2.5m，确保目标进入视野
+- **CENTER 像素伺服**: velocity 模式，body-frame 像素 PID，世界坐标 fallback
+- **DESCEND 继承 PID**: 从 CENTER 无缝过渡，下降中持续对准
 - **TargetTracker**: Kalman 滤波 + 4 状态容错 + commit 机制
-- **CoordinateMapper**: 像素→世界坐标独立模块
+- **CoordinateMapper**: 像素→世界坐标独立模块 (支持 real roll/pitch)
 - **像素聚类建图**: 50px 半径, bucketId 投票, 不依赖 YOLO 标签
-- **REACQUIRE 三阶段恢复**: Hover→Spiral→Climb
+- **世界坐标兜底**: 视觉丢失后导航到 SCAN 地图坐标过渡
 - **连续 N 帧丢失确认**: 消除单帧闪烁误触发
-- **GOTO 低空靠近**: 位置模式飞到 1.4m, PID 仅做最后下降
-- **投弹后稳定爬升**: 5s 升到 3.5m 再过渡到侦察
+- **PID 积分保护**: 无有效像素时不更新 PID，防止垃圾数据污染
+- **投弹后稳定爬升**: CLIMB 回到 3.5m 再过渡到侦察

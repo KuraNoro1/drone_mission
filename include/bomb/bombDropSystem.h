@@ -15,6 +15,7 @@
 
 struct DropConfig {
     double searchAlt;       // 扫描高度 (m)
+    double approachAlt;     // 粗逼近高度 (m)
     double dropAlt;         // 投弹高度 (m)
     double stableDuration;  // 稳定持续时间 (s)
     double velZeroTol;      // 速度阈值 (m/s)
@@ -48,11 +49,14 @@ public:
     int getDropCount() const { return dropCount_; }
 
 private:
-    enum class Phase { SCAN, SELECT, CENTER, DESCEND, CLIMB, DONE };
+    enum class Phase { SCAN, SELECT, GOTO, CENTER, DESCEND, CLIMB, DONE };
 
     // ── 扫描 ──
     bool scanForTargets(double timeoutSec);
     bool selectNextTarget();
+
+    // ── 粗逼近 (位置模式飞到目标上方 2.0m) ──
+    bool gotoWorldTarget();
 
     // ── 纯视觉对准 (同高度) ──
     bool centerAboveTarget();

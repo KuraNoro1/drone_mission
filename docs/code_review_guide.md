@@ -47,7 +47,7 @@
 // 5. altitude 下限 — alt<0.1 强制为 0.1 防除零
 ```
 
-**当前已知问题**: 未使用真实的 roll/pitch 值 (传 0,0)，导致 ~0.5-1m 映射误差。
+**已知问题 (已修复)**: roll/pitch 现已从 `droneLink.attitudeRollDeg/PitchDeg()` 传入所有 `pixelToWorld/worldToPixel` 调用。
 
 ### `src/bomb/targetTracker.cpp`
 
@@ -91,47 +91,44 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 // - 聚类未考虑桶尺寸差异 — 15cm和25cm桶在3.5m高像素差异约 19px
 ```
 
-**关键函数**: `trackAndDescend()`
+**关键函数**: `gotoWorldTarget()`, `centerAboveTarget()`
 
 ```cpp
-// 控制分流:
-if (VISIBLE/LOST_SHORT) {
-    if (committed) → World PID
-    else → Pixel PID
-} else if (committed) {
-    → 弱世界坐标修正 (k=0.15)
-} else if (!committed) {
-    → 进入 REACQUIRE
-}
+// GOTO: 位置模式飞到目标上方 cfg_.approachAlt (2.5m)
+// CENTER: velocity 模式像素伺服, cfg_.approachAlt 保持高度
+// DESCEND: 从 cfg_.approachAlt 降至 cfg_.dropAlt (1.8m), 继承 CENTER PID
 
-// 高度控制:
-if (!committed && !VISIBLE) → vz=0 (暂停下降)
-else → vz = kpZ * (alt - dropAlt) (继续下降)
+// 控制分流:
+// 有像素: 像素伺服 (body-frame velocity)
+// 无像素 >0.5s: 世界坐标兜底 (导航到 SCAN 地图坐标)
+// 视觉丢失 >3s (DESCEND) / >5s (CENTER): 放弃本目标
+
+// PID 保护: hasPix 为 false 时不调用 pidX_->update(), 防止垃圾数据污染积分
 
 // 审查要点:
-// 1. PID 是否在合适时机 reset
-// 2. committed 后丢失是否继续下降
-// 3. REACQUIRE 冷却和次数上限
+// 1. GOTO 是否足够靠近目标 (dist<0.5m + alt 达标)
+// 2. CENTER 开始后首帧是否有像素 (GOTO 应确保目标在视野内)
+// 3. DESCEND 下降速度 0.3 m/s 是否安全
 ```
 
-**关键函数**: `predictAndDrop()`
+**关键函数**: `descendAndDrop()`
 
 ```cpp
-// 投弹五条件:
-cond1 = pixelErr < 20px || committed
-cond2 = 水平速度 < velZeroTol (0.05m/s)
-cond3 = |alt - 1.0m| < altTolerance
-cond4 = 稳定 > 0.5s
-cond5 = true (无置信度判断)
+// 投弹五条件 (在到达 1.8m 后检查):
+cond1 = pixelErr < 15px
+cond2 = 水平速度 < velZeroTol (0.15m/s)
+cond3 = |alt - 1.8m| < altTolerance (0.1m)
+cond4 = 稳定 > 0.3s (STABLE_DURATION)
+cond5 = (隐式通过)
 
 // 落点预测:
 tFall = sqrt(2 * alt / 9.81)
 impact = vel * tFall  // 仅日志输出, 未用于决策
 
 // 审查要点:
-// 1. committed后 cond1 自动通过 — 符合设计
-// 2. 稳定时间检查: stableStart 是否正确重置
-// 3. side 选择逻辑: 第一弹选近侧, 第二弹选另一侧
+// 1. 稳定时间检查: convergeStart 是否正确重置
+// 2. side 选择: 第1弹Left, 第2弹自动另一侧
+// 3. releasedDropAlt=true 后不会重置，关注高度漂移
 ```
 
 ### `src/mission/missionStateMachine.cpp`
@@ -172,14 +169,13 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 
 | 循环位置 | 超时机制 | 超时值 |
 |----------|----------|--------|
-| `trackAndDescend()` | `TRACKING_TIMEOUT` | 60s |
-| `predictAndDrop()` | 无显式超时 (靠外层 90s) | implicit |
-| `scanForTargets()` | `timeoutSec` 参数 | 8s / 5s |
-| `gotoWorldTarget()` | `gotoTimeout` | 10s |
-| `visualAlignBriefly()` | `BRIEF_TIMEOUT` | 3s |
-| REACQUIRE HOVER | `raElapsed > 1.0` | 1s |
-| REACQUIRE SPIRAL | `raElapsed > 6.0` | 6s |
-| REACQUIRE CLIMB | `raElapsed > 4.0` | 4s |
+| `centerAboveTarget()` | `CENTER_TIMEOUT` | 30s |
+| `descendAndDrop()` | `DESCEND_TIMEOUT` | 60s |
+| `scanForTargets()` | `timeoutSec` 参数 | 8s |
+| `gotoWorldTarget()` | `GOTO_TIMEOUT` | 15s |
+| CENTER lost | `LOST_TIMEOUT` | 5s |
+| DESCEND lost | `LOST_TIMEOUT` | 3s |
+| 全局超时 | `totalTimeout` | 90s |
 
 ### 3.2 Offboard 模式切换真空期
 
@@ -206,14 +202,12 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 ```
 [BOMB] Phase: SCAN          → 投放流程开始
 [BOMB] Map: 桶XX @(N,E)     → 建图结果
-[BOMB] GOTO: (N,E) at Hm    → 导航目标
-[BOMB] TRACKING: ...        → 跟踪开始
-[BOMB] REACQUIRE #N: ...    → 进入恢复 (检查次数和触发原因)
-[BOMB] TARGET COMMITTED     → commit 成功 (检查高度)
-[BOMB] >>>>> DROP ...       → 投弹 (检查 err/vel/alt/commit)
-[BOMB] CLIMB: to Hm         → 爬升
+[BOMB] GOTO: 桶XX @world(N,E) at Xm → 粗逼近
+[BOMB] CENTER: centering...  → 像素伺服开始
+[BOMB] DESCEND: 桶XX from Xm to Xm → 下降
+[BOMB] >>>>> DROP ...       → 投弹 (检查 err/vel/alt)
+[BOMB] CLIMB: to Xm         → 爬升
 [DROP] BombDropSystem finished: drops=X/2 → 投放结束
-[DROP] Stabilizing...        → 稳定爬升
 STATE: DROP_SEARCH -> TRANSIT_TO_RECON → 侦察开始
 ```
 

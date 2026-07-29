@@ -9,6 +9,8 @@ struct DroneState {
     double east;
     double alt;       // 相对高度 (m, 正=上)
     double yawDeg;
+    double rollDeg;   // 横滚角 (deg, 正=右侧下)
+    double pitchDeg;  // 俯仰角 (deg, 正=抬头)
     double vx;        // NED North速度
     double vy;        // NED East速度
 };

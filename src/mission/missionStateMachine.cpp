@@ -71,6 +71,7 @@ bool missionStateMachine::init() {
         DropConfig dropCfg;
         const auto& vsCfg = config_.visualServo;
         dropCfg.searchAlt       = 3.5;
+        dropCfg.approachAlt     = 2.5;
         dropCfg.dropAlt         = config_.flight.dropAlt;
         dropCfg.stableDuration  = 0.5;
         dropCfg.velZeroTol      = vsCfg.velZeroTol;

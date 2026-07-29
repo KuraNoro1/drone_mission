@@ -43,9 +43,9 @@ void handleDropSearch() {
 ## 二、投放子系统 (`BombDropSystem::execute()`)
 
 ```
-SCAN → SELECT → GOTO → TRACKING → PREDICT → DROP → CLIMB
- (8s)                                ↓         ↓
-                            (失败: 下一目标)     (完成: 下一目标)
+SCAN → SELECT → GOTO → CENTER → DESCEND → DROP → CLIMB
+ (8s)  (pick  (pos模式    (vel模式   (下降)     ↓      ↓
+        target) 2.5m)      2.5m)           (失败: 下一目标) (完成: 下一目标)
 ```
 
 ### SCAN (8s, 3.5m)
@@ -58,68 +58,47 @@ SCAN → SELECT → GOTO → TRACKING → PREDICT → DROP → CLIMB
 ```
 选最高分未使用的目标
 ├─ 有未使用 → GOTO
-└─ 全部用完 → 重新扫描(5s) → 按桶ID去重(新桶)
+└─ 全部用完 → 重新扫描(8s, +0.5m高度)
               ├─ 有结果 → SELECT
               └─ 无结果 → timeout
 ```
 
-### GOTO (position 模式, 1.4m)
+### GOTO (position 模式, 2.5m)
 ```
-offboard_->startPositionModeAt(target_NED, -1.4m)
-while dist > 0.5m: setPositionNed()  ← 位置模式粗定位
+offboard_->startPositionModeAt(target_NED, -2.5m)
+while dist > 0.5m || alt not reached: setPositionNed()
+timeout 15s
 ```
-**为什么用 position 模式**: 飞控内部位置控制器比伴飞脑 PID 更稳定，适合较长距离导航。
+**为什么用 position 模式**: 飞控内部位置控制器比伴飞脑 PID 更稳定，适合较长距离导航。粗逼近让目标进入视野，后续 CENTER 阶段做精对准。
 
-### TRACKING (velocity 模式, 1.4m → 1.0m)
+### CENTER (velocity 模式, 2.5m)
 ```
 offboard_->startVelocityMode()
-5个控制分支:
-
-┌─ VISIBLE/LOST_SHORT ──────────────────────────────┐
-│ 未commit: 视觉 PID (errPx → vx,vy)                │
-│ 已commit: 世界坐标 PID (errN,errE → vx,vy)        │
-│ vz: 继续下降至 1.0m                                 │
-├─ LOST_LONG/REACQUIRE (未commit) ──────────────────┤
-│ vx,vy=0 (悬停), vz=0 (暂停下降)                     │
-├─ LOST_CRITICAL (已commit) ────────────────────────┤
-│ 世界坐标弱修正 (k=0.15), vz: 继续下降                │
-└─ LOST_CRITICAL (未commit) ────────────────────────┘
-  → 失败, 返回 SELECT
+像素伺服: errPx → bodyFrame velocity → NED velocity
+世界坐标兜底: 视觉丢失 >0.5s → 导航到 SCAN 地图坐标
+收敛条件: pixelErr < 15px 持续 0.6s
+失败: 丢失 >5s 或超时 30s → 返回 SELECT
 ```
 
-### REACQUIRE 子状态机
-
-当未commit且目标丢失触发：
-
+### DESCEND (velocity 模式, 2.5m → 1.8m)
 ```
-HOVER (1s) → 悬停检测
-    ↓ 未找到
-SPIRAL (6s) → 围绕最后已知世界坐标螺旋搜索
-    ↓ 半径 0.2m → 0.4m → 0.6m → 1.0m
-    ↓ 未找到
-CLIMB (4s) → 上升扩宽视野
-    ↓ 未找到
-ABORT → 失败, 下一目标
+继承 CENTER PID 积分 (不 reset)
+下降速率: 0.3 m/s, 视觉有效时下降
+到达 1.8m: 5条件投弹检查
+  cond1: pixelErr < 15px
+  cond2: 水平速度 < 0.15m/s
+  cond3: |alt - 1.8m| < 0.1m
+  cond4: 稳定 > 0.3s
+视觉丢失 >3s: 放弃本目标
 ```
 
-**防抖**: 退出 REACQUIRE 后 3s 冷却期, 每轮最多 5 次
-
-### PREDICT (velocity 模式, 1.0m)
-
-五条件投弹判断:
+### DROP
 ```
-cond1: pixelErr < 20px || committed
-cond2: 水平速度 < velZeroTol
-cond3: |alt - 1.0m| < altTolerance
-cond4: 持续稳定 > stableDuration (0.5s)
-cond5: 检测率 (当前始终为 true)
-```
-
-落点预测:
-```
-tFall = sqrt(2h / g)
-impact_N = vx * tFall
-impact_E = vy * tFall
+落点预测 (仅日志):
+  tFall = sqrt(2h/g)
+  impact_N = vx * tFall
+释放逻辑: 第一弹 Left, 第二弹 Right
+PWM: releasePwm=1900 (800ms), 然后 holdPwm=1100
 ```
 
 ### CLIMB (position 模式)
@@ -184,12 +163,12 @@ commit 后:
 ```
 t=0      进入 DROP_SEARCH
 t=0-8s   SCAN: 悬停扫描 + 建图
-t=8s     选目标 → GOTO position模式 1.4m
-t=11s    GOTO到达 → TRACKING velocity模式
-t=12s    下降到 1.0m
-t=13s    五条件满足 → 投弹
-t=14s    CLIMB 爬升 3.5m
-t=18s    SELEC T下一目标
+t=8s     选目标 → GOTO position模式 2.5m
+t=15s    GOTO到达 → CENTER velocity模式 2.5m (像素伺服)
+t=20s    CENTER 收敛 → DESCEND 开始下降
+t=23s    降至 1.8m, 五条件满足 → 投弹
+t=24s    CLIMB 爬升至 3.5m
+t=28s    SELECT 下一目标
 ...
 t=90s    全局超时 → 强制投弹 → RECON
 ```

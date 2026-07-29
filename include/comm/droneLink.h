@@ -25,6 +25,8 @@ public:
     bool inAir() const;
     bool armed() const;
     float headingDeg() const;
+    float attitudeRollDeg() const;
+    float attitudePitchDeg() const;
 
     nedCoord nedPosition() const;
     nedCoord nedVelocity() const;
@@ -47,6 +49,8 @@ private:
     gpsOrigin gpsOrigin_;
     bool connected_;
     double latestDistanceM_;
+    double latestRollDeg_;
+    double latestPitchDeg_;
     int altPipeFd_;
     std::string altPipePath_;
 };
