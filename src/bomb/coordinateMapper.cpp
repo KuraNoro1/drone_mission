@@ -101,6 +101,10 @@ WorldTarget pixelToWorld(double u, double v, double radiusPx,
     double camE = droneEast  + camOffsetNed.y;
 
     // 7. 与地平面求交 (地面在 NED D = -altitude, 即z_ground = -altitude)
+    // 实际上从相机位置指向地面: camD + t * rNed.z = -altitude (地平面)
+    // 但注意: 我们以无人机NED位置为参考, 地面在NED D=0处
+    // 相机NED位置: camN, camE, camD (-altitude + 相机偏移z分量)
+    // 地面平面: z = 0 (在相对NED系中, 地面z=0)
     double groundZ = 0.0;
     double camZ = -altitude + camOffsetNed.z;  // NED Z (正值=下)
 
@@ -117,10 +121,9 @@ WorldTarget pixelToWorld(double u, double v, double radiusPx,
     result.east  = camE + t * rNed.y;
     result.valid = true;
 
-    // 8. 真实直径估算 (使用斜距替代高度, 确保不同高度下同一目标直径一致)
+    // 8. 真实直径估算 (相似三角形, 用fx近似)
     if (radiusPx > 0) {
-        double slantDist = t * std::sqrt(rNed.x * rNed.x + rNed.y * rNed.y + rNed.z * rNed.z);
-        result.diameter = radiusPx * slantDist * 2.0 / intrinsics.fx;
+        result.diameter = radiusPx * altitude * 2.0 / intrinsics.fx;
     } else {
         result.diameter = 0;
     }
@@ -129,6 +132,7 @@ WorldTarget pixelToWorld(double u, double v, double radiusPx,
 }
 
 // ── 世界坐标 → 像素坐标 ────────────────────────────────────
+
 bool worldToPixel(double worldN, double worldE,
                   const CameraIntrinsics& intrinsics,
                   const CameraExtrinsics& extrinsics,
@@ -145,26 +149,23 @@ bool worldToPixel(double worldN, double worldE,
 
     double camZ = -altitude + camOffsetNed.z;
 
-    // NED向量: 从相机指向世界目标
     double dN = worldN - droneNorth - camOffsetNed.x;
     double dE = worldE - droneEast  - camOffsetNed.y;
-    double dD = 0.0 - camZ;   // 地面在z=0
+    double dD = 0.0 - camZ;
 
-    // R_b2n^T * [dN, dE, dD]^T (旋转矩阵的逆=转置)
     double cy = std::cos(yaw), sy = std::sin(yaw);
     double cp = std::cos(pitch), sp = std::sin(pitch);
-    double cr = std::cos(roll),  sr = std::sin(roll);
+    double cr = std::cos(roll), sr = std::sin(roll);
 
     double bod_x = cy*cp*dN + sy*cp*dE - sp*dD;
     double bod_y = (cy*sp*sr - sy*cr)*dN + (sy*sp*sr + cy*cr)*dE + cp*sr*dD;
     double bod_z = (cy*sp*cr + sy*sr)*dN + (sy*sp*cr - cy*sr)*dE + cp*cr*dD;
 
-    // R_c2b^T: camera = R_c2b^T * body (R_c2b = [[0,1,0],[1,0,0],[0,0,1]])
     double cam_x = bod_y;
     double cam_y = bod_x;
     double cam_z = bod_z;
 
-    if (cam_z <= 0) return false;   // 点在相机后方
+    if (cam_z <= 0) return false;
 
     double xn = cam_x / cam_z;
     double yn = cam_y / cam_z;

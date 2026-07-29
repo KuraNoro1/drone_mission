@@ -64,14 +64,14 @@ bool missionStateMachine::init() {
     reconPipe_ = std::make_unique<reconPipe>("/tmp/recon_pipe");
     reconPipe_->open();
 
+    link_.enableAltitudePipe("/tmp/altitude_pipe");
+
     bombSystem_ = std::make_unique<BombDropSystem>(link_, *offboard_, *servo_, *bucketPipe_);
     {
         DropConfig dropCfg;
         const auto& vsCfg = config_.visualServo;
         dropCfg.searchAlt       = 3.5;
-        dropCfg.approachAlt     = 2.5;
         dropCfg.dropAlt         = config_.flight.dropAlt;
-        dropCfg.gotoTimeout     = 10.0;
         dropCfg.stableDuration  = 0.5;
         dropCfg.velZeroTol      = vsCfg.velZeroTol;
         dropCfg.altTolerance    = vsCfg.altTolerance;
@@ -105,8 +105,17 @@ bool missionStateMachine::init() {
         " (" + (missionPriority_ == 1 ? "small bucket first" : "big bucket first") + ")");
 
     sleep_for(seconds(2));
-    initYaw_ = link_.headingDeg();
-    log("Initial heading locked: " + std::to_string(initYaw_) + " deg");
+    {
+        double measured = static_cast<double>(link_.headingDeg());
+        double ref = config_.yawCalibration.referenceHeading;
+        double error = measured - ref;
+        while (error > 180.0) error -= 360.0;
+        while (error < -180.0) error += 360.0;
+        initYaw_ = static_cast<float>(ref);
+        log("Yaw calibration: measured=" + std::to_string(measured).substr(0,5) +
+            " ref=" + std::to_string(ref) + " error=" + std::to_string(error).substr(0,5) +
+            " corrected=" + std::to_string(initYaw_).substr(0,5) + " deg");
+    }
 
     log("========================================");
     if (isatty(STDIN_FILENO)) {

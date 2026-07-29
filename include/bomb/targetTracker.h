@@ -21,13 +21,6 @@ enum class TargetState {
     LOST_CRITICAL    // 严重丢失 (大量连续帧丢失, 放弃)
 };
 
-// 匹配到的像素目标，供PID使用
-struct PixelTarget {
-    double cx, cy;   // 像素坐标
-    int bucketId;    // YOLO返回的标签（仅供参考）
-    bool valid;
-};
-
 struct TargetTrack {
     int bucketId;
     WorldTarget worldPos;       // Kalman滤波后的世界坐标
@@ -40,40 +33,53 @@ struct TargetTrack {
     double horizontalErrAtCommit;
     int stableSeenFrames;       // 连续检测帧数
     int consecutiveLostFrames;  // 连续丢失帧数
-    double lastPixelCx, lastPixelCy;  // 上一次匹配的像素位置
-    bool hasPixelMatch;               // 当前帧是否匹配成功
-    PixelTarget matchedPixel;         // 当前帧匹配到的像素目标
 };
 
 class TargetTracker {
 public:
     TargetTracker();
 
+    // 更新追踪器：输入视觉检测列表、无人机状态、相机参数
     void update(const multiBucketData& detections,
                 const DroneState& drone,
                 const CameraIntrinsics& intrinsics,
                 const CameraExtrinsics& extrinsics);
 
-    // lockTarget: 锁定目标，传入bucketId（仅用于日志/显示）和预期的世界坐标
-    void lockTarget(int bucketId, const WorldTarget& worldPos);
+    // 锁定目标（仅桶ID，用于老逻辑）
+    void lockTarget(int bucketId);
+
+    // 锁定目标并初始化世界坐标（推荐使用）
+    void lockTarget(int bucketId, const WorldTarget& initialPos);
+
+    // 解锁
     void unlock();
 
+    // 获取当前状态
     TargetState getState() const { return track_.state; }
     const char* stateName() const;
 
+    // 获取滤波后的世界坐标
     WorldTarget getWorldTarget() const;
-    PixelTarget getPixelTarget() const { return track_.matchedPixel; }
-    bool hasPixelTarget() const { return track_.hasPixelMatch; }
 
+    // 判断是否有效（有目标且状态可接受）
     bool isValid() const;
+
+    // 尝试提交目标（当高度低于阈值且误差足够小时）
     bool tryCommit(double commitHeight);
+
+    // 是否已提交
     bool isCommitted() const { return track_.committed; }
 
-    bool hasTarget() const { return hasTarget_; }
+    // 是否有目标（已锁定）
+    bool hasTarget() const { return lockedBucketId_ > 0; }
+
+    // 获取锁定的桶ID
     int getLockedId() const { return lockedBucketId_; }
+
+    // 丢失时长（秒）
     double lostDuration() const;
 
-    // 可调参数
+    // 可调参数（可在外部修改）
     double lostShortThreshold = 0.5;
     double lostLongThreshold  = 2.0;
     double commitAltThreshold = 3.0;
@@ -81,12 +87,9 @@ public:
     int    commitStableFrames = 8;
     int    lostConfirmFrames  = 4;    // 连续N帧丢失才确认
     int    criticalLostFrames = 40;   // 连续40帧=2s才进入CRITICAL
-    double maxPixelDist       = 100.0; // 像素空间匹配最大距离
 
 private:
-    bool hasTarget_;
     int lockedBucketId_;
-    WorldTarget expectedWorld_;
     TargetTrack track_;
     KalmanFilter2D kf_;
     double elapsedTime_;

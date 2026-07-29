@@ -15,9 +15,7 @@
 
 struct DropConfig {
     double searchAlt;       // 扫描高度 (m)
-    double approachAlt;     // 靠近目标高度 (m), position模式飞到该高度
     double dropAlt;         // 投弹高度 (m)
-    double gotoTimeout;     // goto 超时 (s)
     double stableDuration;  // 稳定持续时间 (s)
     double velZeroTol;      // 速度阈值 (m/s)
     double altTolerance;    // 高度容差 (m)
@@ -50,29 +48,26 @@ public:
     int getDropCount() const { return dropCount_; }
 
 private:
-    enum class Phase { SCAN, SELECT, GOTO, TRACKING, PREDICT, CLIMB, DONE };
+    enum class Phase { SCAN, SELECT, CENTER, DESCEND, CLIMB, DONE };
 
     // ── 扫描 ──
     bool scanForTargets(double timeoutSec);
     bool selectNextTarget();
 
-    // ── 导航到目标世界坐标 ──
-    bool gotoWorldTarget();
+    // ── 纯视觉对准 (同高度) ──
+    bool centerAboveTarget();
 
-    // ── 跟踪下降 (用TargetTracker容错状态机) ──
-    bool trackAndDescend();
-
-    // ── 落点预测 + 投弹 ──
-    bool predictAndDrop();
+    // ── 垂直下降 + 投弹 (纯视觉) ──
+    bool descendAndDrop();
 
     // ── 爬升 ──
     bool climbToSearchAlt();
 
-    // ── 飞回扫描原点 ──
-    bool flyToScanOrigin();
-
     void releasePayload(const std::string& side);
     DroneState getDroneState() const;
+
+    // ── 飞回扫描原点 ──
+    bool flyToScanOrigin();
 
     droneLink& link_;
     offboardControl& offboard_;
@@ -88,6 +83,8 @@ private:
     int dropCount_;
     std::vector<std::string> droppedSides_;
     float initYaw_;
+    double yawBias_;        // headingDeg - initYaw_ (航向角校准偏置)
+    double correctedYawDeg() const;  // 返回经校准的航向角 (deg)
 
     // 目标地图
     struct MapEntry { WorldTarget world; int bucketId; double score; bool used; };
@@ -102,7 +99,9 @@ private:
     std::unique_ptr<pidController> pidY_;
 
     std::chrono::steady_clock::time_point loopStart_;
-    double scanOriginN_;    // 投弹区扫描原点 N
-    double scanOriginE_;    // 投弹区扫描原点 E
-    bool lastHasPix_;   // 记录上一帧是否有像素，用于视觉丢失时重置PID
+
+    // 扫描原点 (第一次 SCAN 时记录)
+    double scanOriginN_;
+    double scanOriginE_;
+    bool lastHasPix_;
 };

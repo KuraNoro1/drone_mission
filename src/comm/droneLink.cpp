@@ -91,13 +91,17 @@ void droneLink::enableAltitudePipe(const std::string& path) {
     altPipePath_ = path;
     ::unlink(path.c_str());
     ::mkfifo(path.c_str(), 0666);
-    altPipeFd_ = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
-    if (altPipeFd_ < 0) {
-        log("WARNING: Cannot open altitude pipe: " + path +
-            " (" + std::string(strerror(errno)) + ")");
-    } else {
-        log("Altitude pipe opened: " + path);
+    // 阻塞等待 Python 端打开读端 (最多重试30次×200ms=6s)
+    for (int retry = 0; retry < 30; ++retry) {
+        altPipeFd_ = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
+        if (altPipeFd_ >= 0) {
+            log("Altitude pipe opened: " + path);
+            return;
+        }
+        sleep_for(milliseconds(200));
     }
+    log("WARNING: Cannot open altitude pipe: " + path +
+        " (" + std::string(strerror(errno)) + ")");
 }
 
 double droneLink::altitude() const {
