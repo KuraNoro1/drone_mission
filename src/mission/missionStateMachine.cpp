@@ -1189,11 +1189,13 @@ void missionStateMachine::handleRtl() {
         "m at " + std::to_string(rtlAlt) + "m, " +
         std::to_string(rtlTime).substr(0,4) + "s...");
 
-    // Phase A: cruise to home, pre-read H pipe during transit
+    // Phase A: cruise toward home, break early when H-mark likely in view
     bool hSeenDuringCruise = false;
     if (!offboard_->startPositionModeAt(0.0f, 0.0f, -rtlAlt, initYaw_)) {
     } else {
         auto t0 = steady_clock::now();
+        const double CRUISE_TRIGGER_DIST = 5.0;   // 距原点 ~5m 时切 H 导引
+        double rtlTime = std::max(25.0, distToHome / 3.0 + 5.0);
         while (running_ && link_.isConnected() &&
                duration<double>(steady_clock::now() - t0).count() < rtlTime) {
             offboard_->setPositionNed(0.0f, 0.0f, -rtlAlt, initYaw_);
@@ -1202,6 +1204,13 @@ void missionStateMachine::handleRtl() {
                 if (hPipe_->readLatest(hCx, hCy)) {
                     hSeenDuringCruise = true;
                 }
+            }
+            auto nedNow = link_.nedPosition();
+            double distNow = std::hypot(nedNow.northM, nedNow.eastM);
+            if (distNow < CRUISE_TRIGGER_DIST) {
+                log("[RTL] Within " + std::to_string(CRUISE_TRIGGER_DIST).substr(0,3) +
+                    "m of home, switching to H-guided descent");
+                break;
             }
             sleep_for(milliseconds(500));
         }

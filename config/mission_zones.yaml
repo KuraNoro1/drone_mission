@@ -1,6 +1,6 @@
 # 投放区 & 侦察区 (相对机头前方距离 + 航点偏移)
 dropZone:
-  forwardDistance: 30.0     # 机头前方距离 (m)
+  forwardDistance: 32.5     # 机头前方距离 (m) — 投放区中心
   priority: 0               # 0=优先大桶(25cm), 1=优先小桶(15cm)
 
 reconZone:
