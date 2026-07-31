@@ -31,6 +31,7 @@ missionStateMachine::missionStateMachine(droneLink& link, const missionConfigDat
       initYaw_(0), missionPriority_(0), reconWpIndex_(0), dropSearchPhase_(0),
       bucketFound_(false), hasLastTarget_(false), dropCount_(0),
       dropZoneEnterTime_(steady_clock::now()),
+      visionPipeReady_(false),
       dropTargetN_(0), dropTargetE_(0), reconOriginN_(0), reconOriginE_(0),
       stableDetectCount_(0), lastDetectTargetId_(0),
       searchCooldownStart_(steady_clock::now()) {
@@ -270,6 +271,7 @@ void missionStateMachine::handleTransitToDrop() {
     }
 
     dropZoneEnterTime_ = steady_clock::now();
+    visionPipeReady_ = false;
     dropSearchPhase_ = 0;
     bucketFound_ = false;
     hasLastTarget_ = false;
@@ -412,6 +414,21 @@ void missionStateMachine::handleDropSearch() {
         log("[DROP] Not yet at drop zone (dist=" + std::to_string((int)distFromTarget) + "m), waiting...");
         sleep_for(milliseconds(100));
         return;
+    }
+
+    if (!visionPipeReady_) {
+        multiBucketData vis;
+        if (bucketPipe_->readLatest(vis)) {
+            visionPipeReady_ = true;
+            dropZoneEnterTime_ = steady_clock::now();
+            log("[DROP] Vision pipe ready (first frame received), 90s countdown starts");
+        } else {
+            static int waitCnt = 0;
+            if (++waitCnt % 20 == 1)
+                log("[DROP] Waiting for vision pipe to become ready...");
+            sleep_for(milliseconds(100));
+            return;
+        }
     }
 
     double elapsed = duration<double>(steady_clock::now() - dropZoneEnterTime_).count();

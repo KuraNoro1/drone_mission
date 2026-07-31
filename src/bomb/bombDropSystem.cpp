@@ -116,15 +116,8 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
     while (dropCount_ < 2) {
         double elapsed = duration<double>(steady_clock::now() - loopStart_).count();
         if (elapsed > totalTimeout) {
-            log("Global timeout, releasing remaining");
+            log("Global timeout, deferring to forceDropAll");
             result.timedOut = true;
-            while (dropCount_ < 2) {
-                int ch = (dropCount_ == 0) ? cfg_.leftChannel : cfg_.rightChannel;
-                servo_.setPwm(ch, cfg_.releasePwm);
-                sleep_for(milliseconds(static_cast<int>(cfg_.releaseDurationMs)));
-                servo_.setPwm(ch, cfg_.holdPwm);
-                dropCount_++; sleep_for(milliseconds(300));
-            }
             break;
         }
         if (!link_.isConnected()) { result.timedOut = true; break; }

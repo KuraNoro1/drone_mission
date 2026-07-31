@@ -93,6 +93,7 @@ private:
     int dropCount_;
     std::vector<std::string> droppedSides_;
     std::chrono::steady_clock::time_point dropZoneEnterTime_;
+    bool visionPipeReady_;
 
     float dropTargetN_;
     float dropTargetE_;
