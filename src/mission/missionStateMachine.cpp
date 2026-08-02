@@ -109,14 +109,8 @@ bool missionStateMachine::init() {
     sleep_for(seconds(2));
     {
         double measured = static_cast<double>(link_.headingDeg());
-        double ref = config_.yawCalibration.referenceHeading;
-        double error = measured - ref;
-        while (error > 180.0) error -= 360.0;
-        while (error < -180.0) error += 360.0;
-        initYaw_ = static_cast<float>(ref);
-        log("Yaw calibration: measured=" + std::to_string(measured).substr(0,5) +
-            " ref=" + std::to_string(ref) + " error=" + std::to_string(error).substr(0,5) +
-            " corrected=" + std::to_string(initYaw_).substr(0,5) + " deg");
+        initYaw_ = static_cast<float>(measured);
+        log("Mission heading: " + std::to_string(initYaw_).substr(0,5) + " deg");
     }
 
     log("========================================");
@@ -1284,8 +1278,11 @@ void missionStateMachine::handleRtl() {
             double errX = hCx - imgCenterX;
             double errY = hCy - imgCenterY;
             double altClamped = std::max(static_cast<double>(currentAlt), 0.3);
-            lastWorldErrN = -errY * altClamped / fy;
-            lastWorldErrE =  errX * altClamped / fx;
+            double bodyErrFwd = errY * altClamped / fy;
+            double bodyErrRgt = errX * altClamped / fx;
+            double yawRad = static_cast<double>(link_.headingDeg()) * M_PI / 180.0;
+            lastWorldErrN = std::cos(yawRad) * bodyErrFwd - std::sin(yawRad) * bodyErrRgt;
+            lastWorldErrE = std::sin(yawRad) * bodyErrFwd + std::cos(yawRad) * bodyErrRgt;
             vx = kpTrack * lastWorldErrN;
             vy = kpTrack * lastWorldErrE;
             vx = std::max(-maxVelH, std::min(maxVelH, vx));

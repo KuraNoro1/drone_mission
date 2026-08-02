@@ -523,7 +523,7 @@ bool BombDropSystem::centerAboveTarget() {
         if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
             double errV = (pixCy - cy) / cy;
-            double bodyFwd = pidX_->update(-errV, 0.05);
+            double bodyFwd = pidX_->update( errV, 0.05);
             double bodyRgt = pidY_->update( errU, 0.05);
             bodyFwd *= confidence;
             bodyRgt *= confidence;
@@ -549,13 +549,7 @@ bool BombDropSystem::centerAboveTarget() {
                 vy = vy * (1.0 - w) + wvy * w;
             }
         }
-
-        double maxVel = cfg_.maxVelXY * 0.6;
-        double vMag = std::hypot(vx, vy);
-        if (vMag > maxVel && vMag > 0.001) {
-            vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
-        }
-
+        // ── 垂直控制 ──
         double vz = cfg_.kpZ * (ds.alt - cfg_.approachAlt);
         vz = std::max(-cfg_.maxVelZ, std::min(cfg_.maxVelZ, vz));
 
@@ -674,7 +668,7 @@ bool BombDropSystem::descendAndDrop() {
         if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
             double errV = (pixCy - cy) / cy;
-            double bodyFwd = pidX_->update(-errV, 0.05);
+            double bodyFwd = pidX_->update( errV, 0.05);
             double bodyRgt = pidY_->update( errU, 0.05);
             bodyFwd *= confidence;
             bodyRgt *= confidence;
