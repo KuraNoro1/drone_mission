@@ -55,6 +55,12 @@ private:
     bool scanForTargets(double timeoutSec);
     bool selectNextTarget();
 
+    // ── 首次扫描无目标时, 在机体前后左右 1.5m 四点补扫 ──
+    bool searchSurroundingPoints(double totalTimeout);
+
+    // ── 飞往任意扫描点 ──
+    bool flyToScanPoint(double north, double east);
+
     // ── 粗逼近 (位置模式飞到目标上方 2.0m) ──
     bool gotoWorldTarget();
 

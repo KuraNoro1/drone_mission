@@ -58,6 +58,41 @@ double BombDropSystem::correctedYawDeg() const {
     return static_cast<double>(link_.headingDeg()) - yawBias_;
 }
 
+// ── 辅助：飞往任意扫描点 (位置模式) ──
+bool BombDropSystem::flyToScanPoint(double north, double east) {
+    offboard_.stop();
+    sleep_for(milliseconds(300));
+    if (!offboard_.startPositionModeAt(static_cast<float>(north),
+                                       static_cast<float>(east),
+                                       static_cast<float>(-cfg_.searchAlt),
+                                       initYaw_)) {
+        log("Failed to start position mode to scan point (" +
+            std::to_string(north).substr(0,5) + "," +
+            std::to_string(east).substr(0,5) + ")");
+        return false;
+    }
+
+    auto t0 = steady_clock::now();
+    const double TIMEOUT = 10.0;
+    while (duration<double>(steady_clock::now() - t0).count() < TIMEOUT) {
+        offboard_.setPositionNed(static_cast<float>(north),
+                                 static_cast<float>(east),
+                                 static_cast<float>(-cfg_.searchAlt),
+                                 initYaw_);
+        auto ned = link_.nedPosition();
+        double dist = std::hypot(ned.northM - north, ned.eastM - east);
+        if (dist < 0.5) {
+            log("Arrived at scan point (" + std::to_string(north).substr(0,5) + "," +
+                std::to_string(east).substr(0,5) + ")");
+            return true;
+        }
+        sleep_for(milliseconds(200));
+    }
+    log("Timeout flying to scan point (" + std::to_string(north).substr(0,5) + "," +
+        std::to_string(east).substr(0,5) + ")");
+    return false;
+}
+
 // ── 辅助：飞回扫描原点 ──
 bool BombDropSystem::flyToScanOrigin() {
     if (scanOriginN_ == 0 && scanOriginE_ == 0) {
@@ -67,33 +102,43 @@ bool BombDropSystem::flyToScanOrigin() {
     log("Flying to scan origin (" + std::to_string(scanOriginN_).substr(0,5) + "," +
         std::to_string(scanOriginE_).substr(0,5) + ") at " +
         std::to_string(cfg_.searchAlt) + "m");
+    return flyToScanPoint(scanOriginN_, scanOriginE_);
+}
 
-    offboard_.stop();
-    sleep_for(milliseconds(300));
-    if (!offboard_.startPositionModeAt(static_cast<float>(scanOriginN_),
-                                       static_cast<float>(scanOriginE_),
-                                       static_cast<float>(-cfg_.searchAlt),
-                                       initYaw_)) {
-        log("Failed to start position mode to origin");
-        return false;
-    }
+// ── 首次扫描无目标时, 在机体前后左右 1.5m 四点补扫 ──
+// 机体坐标 → NED: 前=+cos(yaw), 后=-cos(yaw), 左=+sin(yaw), 右=-sin(yaw)
+bool BombDropSystem::searchSurroundingPoints(double totalTimeout) {
+    const double OFF = 1.5;
+    const double yawRad = static_cast<double>(initYaw_) * M_PI / 180.0;
+    const double cy = std::cos(yawRad), sy = std::sin(yawRad);
+    const double fwdN = cy * OFF, fwdE = sy * OFF;
+    const double rgtN = -sy * OFF, rgtE = cy * OFF;
 
-    auto t0 = steady_clock::now();
-    const double TIMEOUT = 10.0;
-    while (duration<double>(steady_clock::now() - t0).count() < TIMEOUT) {
-        offboard_.setPositionNed(static_cast<float>(scanOriginN_),
-                                 static_cast<float>(scanOriginE_),
-                                 static_cast<float>(-cfg_.searchAlt),
-                                 initYaw_);
-        auto ned = link_.nedPosition();
-        double dist = std::hypot(ned.northM - scanOriginN_, ned.eastM - scanOriginE_);
-        if (dist < 0.5) {
-            log("Arrived at scan origin");
+    const double base[4][2] = {
+        { fwdN,            fwdE            },  // 前
+        { -fwdN,          -fwdE            },  // 后
+        { rgtN,            rgtE            },  // 右
+        { -rgtN,          -rgtE            }   // 左
+    };
+    const char* labels[4] = {"front", "back", "right", "left"};
+
+    for (int i = 0; i < 4; ++i) {
+        double elapsed = duration<double>(steady_clock::now() - loopStart_).count();
+        if (totalTimeout - elapsed < 15.0) {
+            log("Search: remaining budget < 15s, stopping surrounding scan");
+            return false;
+        }
+        double n = scanOriginN_ + base[i][0];
+        double e = scanOriginE_ + base[i][1];
+        log("Searching " + std::string(labels[i]) + " point (" +
+            std::to_string(n).substr(0,5) + "," + std::to_string(e).substr(0,5) + ")");
+        if (!flyToScanPoint(n, e)) continue;
+        if (scanForTargets(6.0)) {
+            log("Found targets at " + std::string(labels[i]) + " point");
             return true;
         }
-        sleep_for(milliseconds(200));
     }
-    log("Timeout flying to scan origin");
+    log("Surrounding scan done: no targets found");
     return false;
 }
 
@@ -131,7 +176,13 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                 log("Phase: SCAN at " + std::to_string(cfg_.searchAlt) +
                     "m origin=(" + std::to_string(scanOriginN_).substr(0,5) + "," +
                     std::to_string(scanOriginE_).substr(0,5) + ")");
-                if (!scanForTargets(8.0)) { result.timedOut = true; return result; }
+                if (!scanForTargets(8.0)) {
+                    log("Initial scan empty, trying surrounding points...");
+                    if (!searchSurroundingPoints(totalTimeout)) {
+                        result.timedOut = true;
+                        return result;
+                    }
+                }
                 phase_ = Phase::SELECT;
                 break;
             }
