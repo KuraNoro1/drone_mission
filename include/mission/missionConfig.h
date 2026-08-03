@@ -21,6 +21,7 @@ private:
     void parseVision(const YAML::Node& node);
     void parseServo(const YAML::Node& node);
     void parseCamera(const YAML::Node& node);
+    void parseYawCalibration(const YAML::Node& node);
 
     std::string configDir_;
     missionConfigData data_;

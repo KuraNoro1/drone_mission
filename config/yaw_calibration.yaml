@@ -1,0 +1,7 @@
+# 航向角标定
+# 起飞前将无人机机头对准任务方向, 记录此时遥控器/地面站显示的航向角作为 measured
+# reference_heading 为该方向在地理坐标系中的标准航向角 (权威值)
+# 任务将以 reference_heading 作为前向方位, 忽略罗盘偏置导致的测量误差
+# 若航向有偏差, 可微调此值: 右偏则减小, 左偏则增大
+yaw_calibration:
+  reference_heading: 180       # 标准航向角 (deg, 0=正北, 90=正东, 180=正南)

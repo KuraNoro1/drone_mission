@@ -109,8 +109,20 @@ bool missionStateMachine::init() {
     sleep_for(seconds(2));
     {
         double measured = static_cast<double>(link_.headingDeg());
-        initYaw_ = static_cast<float>(measured);
-        log("Mission heading: " + std::to_string(initYaw_).substr(0,5) + " deg");
+        double ref = config_.yawCalibration.referenceHeading;
+        if (ref >= 0.0 && ref <= 360.0) {
+            double error = measured - ref;
+            while (error > 180.0) error -= 360.0;
+            while (error < -180.0) error += 360.0;
+            initYaw_ = static_cast<float>(ref);
+            log("Yaw calibration: measured=" + std::to_string(measured).substr(0,5) +
+                " ref=" + std::to_string(ref) + " error=" + std::to_string(error).substr(0,5) +
+                " mission heading=" + std::to_string(initYaw_).substr(0,5) + " deg");
+        } else {
+            initYaw_ = static_cast<float>(measured);
+            log("Yaw calibration not configured, using measured heading: " +
+                std::to_string(initYaw_).substr(0,5) + " deg");
+        }
     }
 
     log("========================================");
