@@ -97,6 +97,8 @@ private:
 
     float dropTargetN_;
     float dropTargetE_;
+    float takeoffN_;        // 起降时 NED 基准
+    float takeoffE_;
     float reconOriginN_;
     float reconOriginE_;
 

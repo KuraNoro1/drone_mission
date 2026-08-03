@@ -124,8 +124,8 @@ bool BombDropSystem::searchSurroundingPoints(double totalTimeout) {
 
     for (int i = 0; i < 4; ++i) {
         double elapsed = duration<double>(steady_clock::now() - loopStart_).count();
-        if (totalTimeout - elapsed < 15.0) {
-            log("Search: remaining budget < 15s, stopping surrounding scan");
+        if (totalTimeout - elapsed < 20.0) {
+            log("Search: remaining budget < 20s, stopping surrounding scan");
             return false;
         }
         double n = scanOriginN_ + base[i][0];
@@ -298,7 +298,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
     log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m...");
 
     int emptyFrames = 0;
-    const int EMPTY_TIMEOUT_FRAMES = 15;  // 1.5s连续无检测才清空聚类
+    const int EMPTY_TIMEOUT_FRAMES = 30;  // 3s连续无检测才清空聚类
 
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
@@ -662,7 +662,12 @@ bool BombDropSystem::descendAndDrop() {
 
     bool reachedDropAlt = false;
     bool wasConverged = false;
+    bool alignVerified = false;   // 下降前对齐验证
     auto convergeStart = t0;
+    auto alignStableStart_ = t0;
+    bool alignWasOk = false;
+    const double ALIGN_TOL_PX = 25.0;
+    const double ALIGN_STABLE_DUR = 0.5;
     auto lastPixTime = t0;
     char buf[256];
 
@@ -752,9 +757,24 @@ bool BombDropSystem::descendAndDrop() {
             vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
         }
 
+        // ── 下降前对齐验证 ──
+        if (!alignVerified) {
+            double pixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
+            if (hasPix && pixErr < ALIGN_TOL_PX) {
+                if (!alignWasOk) { alignStableStart_ = steady_clock::now(); alignWasOk = true; }
+                if (duration<double>(steady_clock::now() - alignStableStart_).count() >= ALIGN_STABLE_DUR) {
+                    alignVerified = true;
+                    std::snprintf(buf, sizeof(buf), "DESCEND: pre-align verified pixErr=%.0fpx", pixErr);
+                    log(buf);
+                }
+            } else {
+                alignWasOk = false;
+            }
+        }
+
         // ── 垂直控制 ──
         double vz = 0;
-        if (hasPix && !reachedDropAlt) {
+        if (alignVerified && hasPix && !reachedDropAlt) {
             double altToDrop = alt - cfg_.dropAlt;
             if (altToDrop > 0.15) {
                 vz = -DESCENT_RATE;
@@ -814,8 +834,8 @@ bool BombDropSystem::descendAndDrop() {
         if (++cnt % 10 == 1) {
             double logPixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : -1;
             std::snprintf(buf, sizeof(buf),
-                "[DESCEND] alt=%.1f pixErr=%.0f v=(%.2f,%.2f,%.2f) rchd=%d lost=%.1fs conf=%.2f",
-                alt, logPixErr, vx, vy, vz, reachedDropAlt, sincePix, confidence);
+                "[DESCEND] alt=%.1f pixErr=%.0f v=(%.2f,%.2f,%.2f) rchd=%d algn=%d lost=%.1fs conf=%.2f",
+                alt, logPixErr, vx, vy, vz, reachedDropAlt, alignVerified, sincePix, confidence);
             log(buf);
         }
         sleep_for(milliseconds(50));

@@ -32,7 +32,7 @@ missionStateMachine::missionStateMachine(droneLink& link, const missionConfigDat
       bucketFound_(false), hasLastTarget_(false), dropCount_(0),
       dropZoneEnterTime_(steady_clock::now()),
       visionPipeReady_(false),
-      dropTargetN_(0), dropTargetE_(0), reconOriginN_(0), reconOriginE_(0),
+      dropTargetN_(0), dropTargetE_(0), takeoffN_(0), takeoffE_(0), reconOriginN_(0), reconOriginE_(0),
       stableDetectCount_(0), lastDetectTargetId_(0),
       searchCooldownStart_(steady_clock::now()) {
     lastMultiData_ = {0, {}};
@@ -234,9 +234,15 @@ void missionStateMachine::handleTakeoff() {
 void missionStateMachine::handleTransitToDrop() {
     float yawRad = initYaw_ * static_cast<float>(M_PI) / 180.0f;
     float dist = static_cast<float>(config_.dropZone.forwardDistance);
-    dropTargetN_ = std::cos(yawRad) * dist;
-    dropTargetE_ = std::sin(yawRad) * dist;
     float alt = 3.0f;
+
+    {
+        auto ned = link_.nedPosition();
+        takeoffN_ = static_cast<float>(ned.northM);
+        takeoffE_ = static_cast<float>(ned.eastM);
+        dropTargetN_ = takeoffN_ + std::cos(yawRad) * dist;
+        dropTargetE_ = takeoffE_ + std::sin(yawRad) * dist;
+    }
 
     log("[TRANSIT] Drop zone target: NED(" +
         std::to_string(dropTargetN_).substr(0,5) + ", " +
@@ -1107,8 +1113,8 @@ void missionStateMachine::handleTransitToRecon() {
     float cruiseAlt = static_cast<float>(config_.flight.cruiseAlt);
     float yawRad = initYaw_ * static_cast<float>(M_PI) / 180.0f;
     float dist = static_cast<float>(config_.reconZone.forwardDistance);
-    reconOriginN_ = std::cos(yawRad) * dist;
-    reconOriginE_ = std::sin(yawRad) * dist;
+    reconOriginN_ = takeoffN_ + std::cos(yawRad) * dist;
+    reconOriginE_ = takeoffE_ + std::sin(yawRad) * dist;
 
     log("[RECON] Recon zone origin: NED(" +
         std::to_string(reconOriginN_).substr(0,5) + ", " +
@@ -1206,7 +1212,7 @@ void missionStateMachine::handleRtl() {
 
     float rtlAlt = std::min(static_cast<float>(config_.flight.cruiseAlt), 5.0f);
     auto ned = link_.nedPosition();
-    double distToHome = std::hypot(ned.northM, ned.eastM);
+    double distToHome = std::hypot(ned.northM - takeoffN_, ned.eastM - takeoffE_);
     double rtlTime = std::max(25.0, distToHome / 3.0 + 5.0);
     log("Returning home from dist=" + std::to_string((int)distToHome) +
         "m at " + std::to_string(rtlAlt) + "m, " +
@@ -1214,14 +1220,14 @@ void missionStateMachine::handleRtl() {
 
     // Phase A: cruise toward home, break early when H-mark likely in view
     bool hSeenDuringCruise = false;
-    if (!offboard_->startPositionModeAt(0.0f, 0.0f, -rtlAlt, initYaw_)) {
+    if (!offboard_->startPositionModeAt(takeoffN_, takeoffE_, -rtlAlt, initYaw_)) {
     } else {
         auto t0 = steady_clock::now();
         const double CRUISE_TRIGGER_DIST = 5.0;   // 距原点 ~5m 时切 H 导引
         double rtlTime = std::max(25.0, distToHome / 3.0 + 5.0);
         while (running_ && link_.isConnected() &&
                duration<double>(steady_clock::now() - t0).count() < rtlTime) {
-            offboard_->setPositionNed(0.0f, 0.0f, -rtlAlt, initYaw_);
+            offboard_->setPositionNed(takeoffN_, takeoffE_, -rtlAlt, initYaw_);
             if (hPipe_) {
                 double hCx, hCy;
                 if (hPipe_->readLatest(hCx, hCy)) {
@@ -1229,7 +1235,7 @@ void missionStateMachine::handleRtl() {
                 }
             }
             auto nedNow = link_.nedPosition();
-            double distNow = std::hypot(nedNow.northM, nedNow.eastM);
+            double distNow = std::hypot(nedNow.northM - takeoffN_, nedNow.eastM - takeoffE_);
             if (distNow < CRUISE_TRIGGER_DIST) {
                 log("[RTL] Within " + std::to_string(CRUISE_TRIGGER_DIST).substr(0,3) +
                     "m of home, switching to H-guided descent");
