@@ -60,8 +60,6 @@ double BombDropSystem::correctedYawDeg() const {
 
 // ── 辅助：飞往任意扫描点 (位置模式) ──
 bool BombDropSystem::flyToScanPoint(double north, double east) {
-    offboard_.stop();
-    sleep_for(milliseconds(300));
     if (!offboard_.startPositionModeAt(static_cast<float>(north),
                                        static_cast<float>(east),
                                        static_cast<float>(-cfg_.searchAlt),
@@ -200,7 +198,6 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                     log("Temporary re-scan height set to " + std::to_string(newSearchAlt) + "m");
 
                     auto ned = link_.nedPosition();
-                    offboard_.stop(); sleep_for(milliseconds(300));
                     if (!offboard_.startPositionModeAt(static_cast<float>(ned.northM),
                                                        static_cast<float>(ned.eastM),
                                                        static_cast<float>(-newSearchAlt),
@@ -426,9 +423,6 @@ bool BombDropSystem::gotoWorldTarget() {
         std::to_string(target.world.east).substr(0,5) + ") at " +
         std::to_string(approachAlt) + "m");
 
-    offboard_.stop();
-    sleep_for(milliseconds(300));
-
     if (!offboard_.startPositionModeAt(
             static_cast<float>(target.world.north),
             static_cast<float>(target.world.east),
@@ -440,8 +434,8 @@ bool BombDropSystem::gotoWorldTarget() {
 
     auto t0 = steady_clock::now();
     const double GOTO_TIMEOUT = 15.0;
-    const double DIST_TOL = 0.5;
-    const double ALT_TOL = 0.4;
+    const double DIST_TOL = 0.3;
+    const double ALT_TOL = 0.2;
 
     while (duration<double>(steady_clock::now() - t0).count() < GOTO_TIMEOUT) {
         offboard_.setPositionNed(
@@ -487,8 +481,6 @@ bool BombDropSystem::centerAboveTarget() {
     pidY_->reset();
     lastHasPix_ = false;
 
-    offboard_.stop();
-    sleep_for(milliseconds(300));
     if (!offboard_.startVelocityMode()) {
         log("CENTER: Failed to start velocity mode");
         return false;
@@ -497,7 +489,10 @@ bool BombDropSystem::centerAboveTarget() {
     {
         auto tHover = steady_clock::now();
         while (duration<double>(steady_clock::now() - tHover).count() < 0.5) {
-            offboard_.setVelocityNed(0, 0, 0, initYaw_);
+            DroneState ds = getDroneState();
+            double vz = cfg_.kpZ * (ds.alt - cfg_.approachAlt);
+            vz = std::max(-cfg_.maxVelZ, std::min(cfg_.maxVelZ, vz));
+            offboard_.setVelocityNed(0, 0, static_cast<float>(vz), initYaw_);
             sleep_for(milliseconds(50));
         }
     }
@@ -507,14 +502,15 @@ bool BombDropSystem::centerAboveTarget() {
     const double CENTER_TIMEOUT = 30.0;
     const double LOST_TIMEOUT = 5.0;
     const double CONVERGE_TOL_PX = 40.0;
-    const double STABLE_DURATION = 0.6;
+    const int    CONV_WIN = 20;          // 1.0s @ 50ms, 跨越典型检测间隔
+    const int    CONV_MIN = 4;           // 日志数据 ~15-25% 命中率, 20 帧窗口期望 3-5 命中
     const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;
     const double CONF_DECAY = 4.0;
     const double CONF_MIN = 0.65;
 
-    bool wasConverged = false;
-    auto convergeStart = t0;
+    int  convHist[20] = {0};
+    int  convIdx = 0, convCnt = 0, frameCnt = 0;
     auto lastPixTime = t0;
     char buf[256];
 
@@ -610,17 +606,18 @@ bool BombDropSystem::centerAboveTarget() {
         double pixelErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
         bool converged = hasPix && pixelErr < CONVERGE_TOL_PX;
 
-        if (converged) {
-            if (!wasConverged) { convergeStart = steady_clock::now(); wasConverged = true; }
-            if (duration<double>(steady_clock::now() - convergeStart).count() >= STABLE_DURATION) {
-                std::snprintf(buf, sizeof(buf),
-                    "CENTER: converged pixErr=%.0fpx stable=%.2fs",
-                    pixelErr, duration<double>(steady_clock::now() - convergeStart).count());
-                log(buf);
-                return true;
-            }
-        } else {
-            wasConverged = false;
+        frameCnt++;
+        convCnt -= convHist[convIdx];
+        convHist[convIdx] = converged ? 1 : 0;
+        convCnt += convHist[convIdx];
+        convIdx = (convIdx + 1) % CONV_WIN;
+
+        if (frameCnt >= CONV_WIN && convCnt >= CONV_MIN) {
+            std::snprintf(buf, sizeof(buf),
+                "CENTER: converged %d/%d frames pixErr=%.0fpx",
+                convCnt, CONV_WIN, pixelErr);
+            log(buf);
+            return true;
         }
 
         if (sincePix > LOST_TIMEOUT) {
@@ -653,21 +650,26 @@ bool BombDropSystem::descendAndDrop() {
     const double DESCEND_TIMEOUT = 60.0;
     const double LOST_TIMEOUT = 5.0;
     const double DESCENT_RATE = 0.3;
-    const double CONVERGE_TOL_PX = 40.0;
-    const double STABLE_DURATION = 0.3;
     const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;
     const double CONF_DECAY = 4.0;
     const double CONF_MIN = 0.65;
 
     bool reachedDropAlt = false;
-    bool wasConverged = false;
-    bool alignVerified = false;   // 下降前对齐验证
-    auto convergeStart = t0;
-    auto alignStableStart_ = t0;
-    bool alignWasOk = false;
+    bool alignVerified = false;
+
     const double ALIGN_TOL_PX = 40.0;
-    const double ALIGN_STABLE_DUR = 0.5;
+    const int    ALIGN_WIN = 16;         // 0.8s @ 50ms
+    const int    ALIGN_MIN = 3;          // 日志数据 ~15-25% 命中率, 16 帧窗口期望 2-4 命中
+    int  alignHist[16] = {0};
+    int  alignIdx = 0, alignCnt = 0, alignFrameCnt = 0;
+
+    const double DROP_TOL_PX = 40.0;
+    const int    DROP_WIN = 10;          // 0.5s @ 50ms, 投弹略严格
+    const int    DROP_MIN = 3;           // 10 帧中 ≥3 帧, 容忍间歇检测
+    int  dropHist[10] = {0};
+    int  dropIdx = 0, dropCnt = 0, dropFrameCnt = 0;
+
     auto lastPixTime = t0;
     char buf[256];
 
@@ -760,27 +762,32 @@ bool BombDropSystem::descendAndDrop() {
         // ── 下降前对齐验证 ──
         if (!alignVerified) {
             double pixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
-            if (hasPix && pixErr < ALIGN_TOL_PX) {
-                if (!alignWasOk) { alignStableStart_ = steady_clock::now(); alignWasOk = true; }
-                if (duration<double>(steady_clock::now() - alignStableStart_).count() >= ALIGN_STABLE_DUR) {
-                    alignVerified = true;
-                    std::snprintf(buf, sizeof(buf), "DESCEND: pre-align verified pixErr=%.0fpx", pixErr);
-                    log(buf);
-                }
-            } else {
-                alignWasOk = false;
+            bool alignOk = hasPix && pixErr < ALIGN_TOL_PX;
+            alignFrameCnt++;
+            alignCnt -= alignHist[alignIdx];
+            alignHist[alignIdx] = alignOk ? 1 : 0;
+            alignCnt += alignHist[alignIdx];
+            alignIdx = (alignIdx + 1) % ALIGN_WIN;
+            if (alignFrameCnt >= ALIGN_WIN && alignCnt >= ALIGN_MIN) {
+                alignVerified = true;
+                std::snprintf(buf, sizeof(buf), "DESCEND: pre-align %d/%d pixErr=%.0fpx",
+                              alignCnt, ALIGN_WIN, pixErr);
+                log(buf);
             }
         }
 
         // ── 垂直控制 ──
         double vz = 0;
-        if (alignVerified && hasPix && !reachedDropAlt) {
-            double altToDrop = alt - cfg_.dropAlt;
-            if (altToDrop > 0.15) {
-                vz = -DESCENT_RATE;
-            } else {
-                reachedDropAlt = true;
-                log("DESCEND: reached drop alt " + std::to_string(alt).substr(0,4) + "m");
+        if (alignVerified && !reachedDropAlt) {
+            bool shouldDescend = hasPix || sincePix < 2.0;  // 视觉丢失 2s 内保持下降
+            if (shouldDescend) {
+                double altToDrop = alt - cfg_.dropAlt;
+                if (altToDrop > 0.15) {
+                    vz = -DESCENT_RATE;
+                } else {
+                    reachedDropAlt = true;
+                    log("DESCEND: reached drop alt " + std::to_string(alt).substr(0,4) + "m");
+                }
             }
         } else if (reachedDropAlt) {
             double altErr = alt - cfg_.dropAlt;
@@ -799,34 +806,35 @@ bool BombDropSystem::descendAndDrop() {
         if (reachedDropAlt && hasPix) {
             double pixelErr = std::hypot(pixCx - cx, pixCy - cy);
             double velMag = std::hypot(ds.vx, ds.vy);
-            bool pixOk = pixelErr < CONVERGE_TOL_PX;
+            bool pixOk = pixelErr < DROP_TOL_PX;
             bool velOk = velMag < cfg_.velZeroTol;
             bool altOk = std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
+            bool dropOk = pixOk && velOk && altOk;
 
-            if (pixOk && velOk && altOk) {
-                if (!wasConverged) { convergeStart = steady_clock::now(); wasConverged = true; }
-                double sd = duration<double>(steady_clock::now() - convergeStart).count();
-                if (sd >= STABLE_DURATION) {
-                    std::string side = (dropCount_ == 0) ? "Left" :
-                        ((droppedSides_[0] == "Left") ? "Right" : "Left");
-                    double g = 9.81;
-                    double tFall = std::sqrt(2.0 * alt / g);
-                    double impN = ds.vx * tFall, impE = ds.vy * tFall;
+            dropFrameCnt++;
+            dropCnt -= dropHist[dropIdx];
+            dropHist[dropIdx] = dropOk ? 1 : 0;
+            dropCnt += dropHist[dropIdx];
+            dropIdx = (dropIdx + 1) % DROP_WIN;
 
-                    log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
-                    log(">>>>> DROP " + side + " (" + std::to_string(dropCount_+1) + "/2) <<<<<");
-                    std::snprintf(buf, sizeof(buf),
-                        "     pixErr=%.0fpx vel=%.2fm/s alt=%.2fm",
-                        pixelErr, velMag, alt);
-                    log(buf);
-                    std::snprintf(buf, sizeof(buf), "     impact=(%.2f,%.2f)m", impN, impE);
-                    log(buf);
-                    log("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
-                    releasePayload(side);
-                    return true;
-                }
-            } else {
-                wasConverged = false;
+            if (dropFrameCnt >= DROP_WIN && dropCnt >= DROP_MIN) {
+                std::string side = (dropCount_ == 0) ? "Left" :
+                    ((droppedSides_[0] == "Left") ? "Right" : "Left");
+                double g = 9.81;
+                double tFall = std::sqrt(2.0 * alt / g);
+                double impN = ds.vx * tFall, impE = ds.vy * tFall;
+
+                log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+                log(">>>>> DROP " + side + " (" + std::to_string(dropCount_+1) + "/2) <<<<<");
+                std::snprintf(buf, sizeof(buf),
+                    "     %d/%d ok  pixErr=%.0fpx vel=%.2fm/s alt=%.2fm",
+                    dropCnt, DROP_WIN, pixelErr, velMag, alt);
+                log(buf);
+                std::snprintf(buf, sizeof(buf), "     impact=(%.2f,%.2f)m", impN, impE);
+                log(buf);
+                log("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+                releasePayload(side);
+                return true;
             }
         }
 
@@ -847,7 +855,6 @@ bool BombDropSystem::descendAndDrop() {
 bool BombDropSystem::climbToSearchAlt() {
     log("CLIMB: to " + std::to_string(cfg_.searchAlt) + "m");
     tracker_->unlock();
-    offboard_.stop(); sleep_for(milliseconds(300));
     auto ned = link_.nedPosition();
     if (!offboard_.startPositionModeAt(
             static_cast<float>(ned.northM), static_cast<float>(ned.eastM),

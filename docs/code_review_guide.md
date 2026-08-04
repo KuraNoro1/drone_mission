@@ -106,19 +106,19 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 // PID 保护: hasPix 为 false 时不调用 pidX_->update(), 防止垃圾数据污染积分
 
 // 审查要点:
-// 1. GOTO 是否足够靠近目标 (dist<0.5m + alt 达标)
-// 2. CENTER 开始后首帧是否有像素 (GOTO 应确保目标在视野内)
+// 1. GOTO 是否足够靠近目标 (dist<0.3m + |alt-3.0|<0.2m)
+// 2. CENTER 初始 hover 阶段用高度 P 控制防止切换跌落
 // 3. DESCEND 下降速度 0.3 m/s 是否安全
 ```
 
 **关键函数**: `descendAndDrop()`
 
 ```cpp
-// 投弹条件 (在到达 1.8m 后检查):
-cond1 = pixelErr < 40px
-cond2 = 水平速度 < velZeroTol (0.15m/s)
-cond3 = |alt - 1.8m| < altTolerance (0.1m)
-cond4 = 稳定 > 0.3s (STABLE_DURATION)
+// 投弹条件 (滑动窗口, 在到达 1.8m 后检查):
+// DROP_WIN=10, DROP_MIN=3  → 10帧中≥3帧满足全部条件
+// cond1: pixelErr < 40px
+// cond2: 水平速度 < velZeroTol (0.15m/s)
+// cond3: |alt - 1.8m| < altTolerance (0.1m)
 
 // 落点预测:
 tFall = sqrt(2 * alt / 9.81)
@@ -172,17 +172,21 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 | `descendAndDrop()` | `DESCEND_TIMEOUT` | 60s |
 | `scanForTargets()` | `timeoutSec` 参数 | 8s |
 | `gotoWorldTarget()` | `GOTO_TIMEOUT` | 15s |
+| CENTER converged | N/M 滑动窗口 | 20帧中≥4 (1.0s) |
 | CENTER lost | `LOST_TIMEOUT` | 5s |
+| DESCEND pre-align | N/M 滑动窗口 | 16帧中≥3 (0.8s) |
+| DESCEND release | N/M 滑动窗口 | 10帧中≥3 (0.5s) |
 | DESCEND lost | `LOST_TIMEOUT` | 5s |
 | 全局超时 | `totalTimeout` | 90s |
 
 ### 3.2 Offboard 模式切换真空期
 
-**问题**: `stop() → sleep → start()` 中间失去控制
-**缓解**: 
-- 减少 stop/start 次数 (如 handleTransitToRecon 不再 stop)
-- 在低高度 (<2m) 时不切换模式
-- 投弹后先爬升再切换
+**问题**: `stop() → sleep → start()` 中间失去控制, 导致高度跌落
+**已修复**:
+- `startPositionModeAt` 和 `startVelocityMode` 内部自动处理模式切换, 外部不再调用 stop/sleep
+- 切换真空期从 ~400ms 缩减到 ~100ms
+- CENTER 初始 hover 阶段用高度 P 控制替代 vz=0
+- DESCEND 下降阶段视觉丢失 2s 内保持下降, 避免间歇检测卡住
 
 ### 3.3 YOLO 分类与建图不一致
 

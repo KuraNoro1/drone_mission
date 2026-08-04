@@ -63,34 +63,30 @@ SCAN → SELECT → GOTO → CENTER → DESCEND → DROP → CLIMB
               └─ 无结果 → timeout
 ```
 
-### GOTO (position 模式, 2.5m)
+### GOTO (position 模式, 3.0m)
 ```
-offboard_->startPositionModeAt(target_NED, -2.5m)
-while dist > 0.5m || alt not reached: setPositionNed()
+startPositionModeAt 内部自动处理 velocity→position 切换 (无外部 stop/sleep)
+while dist > 0.3m || |alt-3.0| > 0.2m: setPositionNed()
 timeout 15s
 ```
-**为什么用 position 模式**: 飞控内部位置控制器比伴飞脑 PID 更稳定，适合较长距离导航。粗逼近让目标进入视野，后续 CENTER 阶段做精对准。
 
 ### CENTER (velocity 模式, 3.0m)
 ```
-offboard_->startVelocityMode()
+startVelocityMode 内部处理 position→velocity 切换, 无外部 stop/sleep
+初始稳定阶段用高度 P 控制而非 vz=0, 防止模式切换时跌落
 像素伺服: errPx → bodyFrame velocity → NED velocity
 世界坐标兜底: 视觉丢失 >0.5s → 导航到 SCAN 地图坐标
-收敛条件: pixelErr < 40px 持续 0.6s
+收敛条件: 滑动窗口 20帧中≥4帧 pixelErr<40px (1.0s, 容忍80%丢帧)
 失败: 丢失 >5s 或超时 30s → 返回 SELECT
 ```
 
 ### DESCEND (velocity 模式, 3.0m → 1.8m)
 ```
 继承 CENTER PID 积分 (不 reset)
-下降前对齐: pixelErr < 40px 持续 0.5s
-下降速率: 0.3 m/s, 视觉有效时下降
-到达 1.8m: 投弹检查
-  cond1: pixelErr < 40px
-  cond2: 水平速度 < 0.15m/s
-  cond3: |alt - 1.8m| < 0.1m
-  cond4: 稳定 > 0.3s
-视觉丢失 >5s: 放弃本目标
+下降前对齐: 滑动窗口 16帧中≥3帧 pixelErr<40px (0.8s, 容忍81%丢帧)
+下降速率: 0.3 m/s, 视觉丢失 2s 内保持下降 (避免间歇检测卡住)
+丢检测>2s: 悬停等待; 丢检测>5s: 放弃本目标
+到达 1.8m: 滑动窗口 10帧中≥3帧满足 pix+vel+alt (0.5s, 容忍70%丢帧)
 ```
 
 ### DROP

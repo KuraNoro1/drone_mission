@@ -50,6 +50,10 @@ bool offboardControl::startPositionMode() {
 
 bool offboardControl::startPositionModeAt(float north, float east,
                                            float down, float yaw) {
+    if (active_ && !positionMode_) {
+        stop();
+        sleep_for(milliseconds(100));
+    }
     if (active_) return true;
 
     setPositionNed(north, east, down, yaw);
