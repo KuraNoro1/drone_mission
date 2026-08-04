@@ -506,12 +506,12 @@ bool BombDropSystem::centerAboveTarget() {
     auto t0 = steady_clock::now();
     const double CENTER_TIMEOUT = 30.0;
     const double LOST_TIMEOUT = 5.0;
-    const double CONVERGE_TOL_PX = 15.0;
+    const double CONVERGE_TOL_PX = 40.0;
     const double STABLE_DURATION = 0.6;
     const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;
-    const double CONF_DECAY = 1.5;
-    const double CONF_MIN = 0.40;
+    const double CONF_DECAY = 4.0;
+    const double CONF_MIN = 0.65;
 
     bool wasConverged = false;
     auto convergeStart = t0;
@@ -651,14 +651,14 @@ bool BombDropSystem::descendAndDrop() {
     double cx = intrinsics_.cx, cy = intrinsics_.cy;
     auto t0 = steady_clock::now();
     const double DESCEND_TIMEOUT = 60.0;
-    const double LOST_TIMEOUT = 3.0;
+    const double LOST_TIMEOUT = 5.0;
     const double DESCENT_RATE = 0.3;
-    const double CONVERGE_TOL_PX = 15.0;
+    const double CONVERGE_TOL_PX = 40.0;
     const double STABLE_DURATION = 0.3;
     const double MAX_MATCH_PX = 350.0;
     const double CONF_HIGH = 0.20;
-    const double CONF_DECAY = 1.5;
-    const double CONF_MIN = 0.40;
+    const double CONF_DECAY = 4.0;
+    const double CONF_MIN = 0.65;
 
     bool reachedDropAlt = false;
     bool wasConverged = false;
@@ -666,7 +666,7 @@ bool BombDropSystem::descendAndDrop() {
     auto convergeStart = t0;
     auto alignStableStart_ = t0;
     bool alignWasOk = false;
-    const double ALIGN_TOL_PX = 25.0;
+    const double ALIGN_TOL_PX = 40.0;
     const double ALIGN_STABLE_DUR = 0.5;
     auto lastPixTime = t0;
     char buf[256];

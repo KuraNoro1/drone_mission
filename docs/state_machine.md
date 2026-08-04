@@ -71,25 +71,26 @@ timeout 15s
 ```
 **为什么用 position 模式**: 飞控内部位置控制器比伴飞脑 PID 更稳定，适合较长距离导航。粗逼近让目标进入视野，后续 CENTER 阶段做精对准。
 
-### CENTER (velocity 模式, 2.5m)
+### CENTER (velocity 模式, 3.0m)
 ```
 offboard_->startVelocityMode()
 像素伺服: errPx → bodyFrame velocity → NED velocity
 世界坐标兜底: 视觉丢失 >0.5s → 导航到 SCAN 地图坐标
-收敛条件: pixelErr < 15px 持续 0.6s
+收敛条件: pixelErr < 40px 持续 0.6s
 失败: 丢失 >5s 或超时 30s → 返回 SELECT
 ```
 
-### DESCEND (velocity 模式, 2.5m → 1.8m)
+### DESCEND (velocity 模式, 3.0m → 1.8m)
 ```
 继承 CENTER PID 积分 (不 reset)
+下降前对齐: pixelErr < 40px 持续 0.5s
 下降速率: 0.3 m/s, 视觉有效时下降
-到达 1.8m: 5条件投弹检查
-  cond1: pixelErr < 15px
+到达 1.8m: 投弹检查
+  cond1: pixelErr < 40px
   cond2: 水平速度 < 0.15m/s
   cond3: |alt - 1.8m| < 0.1m
   cond4: 稳定 > 0.3s
-视觉丢失 >3s: 放弃本目标
+视觉丢失 >5s: 放弃本目标
 ```
 
 ### DROP

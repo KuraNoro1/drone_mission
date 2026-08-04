@@ -94,14 +94,14 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 **关键函数**: `gotoWorldTarget()`, `centerAboveTarget()`
 
 ```cpp
-// GOTO: 位置模式飞到目标上方 cfg_.approachAlt (2.5m)
+// GOTO: 位置模式飞到目标上方 cfg_.approachAlt (3.0m)
 // CENTER: velocity 模式像素伺服, cfg_.approachAlt 保持高度
 // DESCEND: 从 cfg_.approachAlt 降至 cfg_.dropAlt (1.8m), 继承 CENTER PID
 
 // 控制分流:
 // 有像素: 像素伺服 (body-frame velocity)
 // 无像素 >0.5s: 世界坐标兜底 (导航到 SCAN 地图坐标)
-// 视觉丢失 >3s (DESCEND) / >5s (CENTER): 放弃本目标
+// 视觉丢失 >5s (DESCEND) / >5s (CENTER): 放弃本目标
 
 // PID 保护: hasPix 为 false 时不调用 pidX_->update(), 防止垃圾数据污染积分
 
@@ -114,12 +114,11 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 **关键函数**: `descendAndDrop()`
 
 ```cpp
-// 投弹五条件 (在到达 1.8m 后检查):
-cond1 = pixelErr < 15px
+// 投弹条件 (在到达 1.8m 后检查):
+cond1 = pixelErr < 40px
 cond2 = 水平速度 < velZeroTol (0.15m/s)
 cond3 = |alt - 1.8m| < altTolerance (0.1m)
 cond4 = 稳定 > 0.3s (STABLE_DURATION)
-cond5 = (隐式通过)
 
 // 落点预测:
 tFall = sqrt(2 * alt / 9.81)
@@ -174,7 +173,7 @@ impact = vel * tFall  // 仅日志输出, 未用于决策
 | `scanForTargets()` | `timeoutSec` 参数 | 8s |
 | `gotoWorldTarget()` | `GOTO_TIMEOUT` | 15s |
 | CENTER lost | `LOST_TIMEOUT` | 5s |
-| DESCEND lost | `LOST_TIMEOUT` | 3s |
+| DESCEND lost | `LOST_TIMEOUT` | 5s |
 | 全局超时 | `totalTimeout` | 90s |
 
 ### 3.2 Offboard 模式切换真空期

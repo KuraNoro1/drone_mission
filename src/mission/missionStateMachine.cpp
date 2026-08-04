@@ -72,7 +72,7 @@ bool missionStateMachine::init() {
         DropConfig dropCfg;
         const auto& vsCfg = config_.visualServo;
         dropCfg.searchAlt       = 3.5;
-        dropCfg.approachAlt     = 2.5;
+        dropCfg.approachAlt     = 3.0;
         dropCfg.dropAlt         = config_.flight.dropAlt;
         dropCfg.stableDuration  = 0.5;
         dropCfg.velZeroTol      = vsCfg.velZeroTol;
@@ -1223,7 +1223,7 @@ void missionStateMachine::handleRtl() {
     if (!offboard_->startPositionModeAt(takeoffN_, takeoffE_, -rtlAlt, initYaw_)) {
     } else {
         auto t0 = steady_clock::now();
-        const double CRUISE_TRIGGER_DIST = 5.0;   // 距原点 ~5m 时切 H 导引
+        const double CRUISE_TRIGGER_DIST = 2.0;   // 距起降点 ~2m 时切 H 导引
         double rtlTime = std::max(25.0, distToHome / 3.0 + 5.0);
         while (running_ && link_.isConnected() &&
                duration<double>(steady_clock::now() - t0).count() < rtlTime) {
