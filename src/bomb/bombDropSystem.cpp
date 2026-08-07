@@ -149,8 +149,8 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
     loopStart_ = steady_clock::now();
 
     if (!pidX_) {
-        pidX_ = std::make_unique<pidController>(cfg_.kpXY, 0, 0, cfg_.maxVelXY, 0.5);
-        pidY_ = std::make_unique<pidController>(cfg_.kpXY, 0, 0, cfg_.maxVelXY, 0.5);
+        pidX_ = std::make_unique<pidController>(cfg_.kpXY, 0.15, 0, cfg_.maxVelXY, 0.5);
+        pidY_ = std::make_unique<pidController>(cfg_.kpXY, 0.15, 0, cfg_.maxVelXY, 0.5);
         tracker_ = std::make_unique<TargetTracker>();
     }
 
@@ -504,7 +504,7 @@ bool BombDropSystem::centerAboveTarget() {
     const double CONVERGE_TOL_PX = 40.0;
     const int    CONV_WIN = 20;          // 1.0s @ 50ms, 跨越典型检测间隔
     const int    CONV_MIN = 4;           // 日志数据 ~15-25% 命中率, 20 帧窗口期望 3-5 命中
-    const double MAX_MATCH_PX = 350.0;
+    const double MAX_MATCH_PX = 600.0;   // 距画面中心的最大接受距离, 滤除极端误检
     const double CONF_HIGH = 0.20;
     const double CONF_DECAY = 4.0;
     const double CONF_MIN = 0.65;
@@ -526,26 +526,13 @@ bool BombDropSystem::centerAboveTarget() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 空间邻近匹配: 投影世界坐标→像素, 找最近的检测 ──
+        // ── 目标匹配: 取画面中心最近的检测, 消除对 SCAN 世界坐标精度的依赖 ──
         bool hasPix = false;
         double pixCx = 0, pixCy = 0;
         if (!vis.empty()) {
-            double expU = cx, expV = cy;
-            double yawRad = correctedYawDeg() * M_PI / 180.0;
-            double rollRad = ds.rollDeg * M_PI / 180.0;
-            double pitchRad = ds.pitchDeg * M_PI / 180.0;
-            WorldTarget wt = tracker_->getWorldTarget();
-            if (wt.valid)
-                worldToPixel(wt.north, wt.east, intrinsics_, extrinsics_,
-                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
-            else
-                worldToPixel(target.world.north, target.world.east,
-                             intrinsics_, extrinsics_,
-                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
-
             double bestDist = MAX_MATCH_PX;
             for (const auto& b : vis.buckets) {
-                double d = std::hypot(b.cx - expU, b.cy - expV);
+                double d = std::hypot(b.cx - cx, b.cy - cy);
                 if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
             }
         }
@@ -650,7 +637,7 @@ bool BombDropSystem::descendAndDrop() {
     const double DESCEND_TIMEOUT = 60.0;
     const double LOST_TIMEOUT = 5.0;
     const double DESCENT_RATE = 0.3;
-    const double MAX_MATCH_PX = 350.0;
+    const double MAX_MATCH_PX = 600.0;
     const double CONF_HIGH = 0.20;
     const double CONF_DECAY = 4.0;
     const double CONF_MIN = 0.65;
@@ -684,26 +671,13 @@ bool BombDropSystem::descendAndDrop() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 空间邻近匹配 ──
+        // ── 目标匹配: 取画面中心最近的检测 ──
         bool hasPix = false;
         double pixCx = 0, pixCy = 0;
         if (!vis.empty()) {
-            double expU = cx, expV = cy;
-            double yawRad = correctedYawDeg() * M_PI / 180.0;
-            double rollRad = ds.rollDeg * M_PI / 180.0;
-            double pitchRad = ds.pitchDeg * M_PI / 180.0;
-            WorldTarget wt = tracker_->getWorldTarget();
-            if (wt.valid)
-                worldToPixel(wt.north, wt.east, intrinsics_, extrinsics_,
-                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
-            else
-                worldToPixel(target.world.north, target.world.east,
-                             intrinsics_, extrinsics_,
-                             ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, expU, expV);
-
             double bestDist = MAX_MATCH_PX;
             for (const auto& b : vis.buckets) {
-                double d = std::hypot(b.cx - expU, b.cy - expV);
+                double d = std::hypot(b.cx - cx, b.cy - cy);
                 if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
             }
         }
@@ -783,7 +757,7 @@ bool BombDropSystem::descendAndDrop() {
             if (shouldDescend) {
                 double altToDrop = alt - cfg_.dropAlt;
                 if (altToDrop > 0.15) {
-                    vz = -DESCENT_RATE;
+                    vz = DESCENT_RATE;
                 } else {
                     reachedDropAlt = true;
                     log("DESCEND: reached drop alt " + std::to_string(alt).substr(0,4) + "m");

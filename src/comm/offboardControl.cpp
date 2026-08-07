@@ -24,6 +24,10 @@ offboardControl::offboardControl(droneLink& link)
     : link_(link), active_(false), positionMode_(false) {}
 
 bool offboardControl::startPositionMode() {
+    if (active_ && !positionMode_) {
+        stop();
+        sleep_for(milliseconds(100));
+    }
     if (active_) return true;
 
     auto ned = link_.nedPosition();

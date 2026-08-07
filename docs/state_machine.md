@@ -74,8 +74,8 @@ timeout 15s
 ```
 startVelocityMode 内部处理 position→velocity 切换, 无外部 stop/sleep
 初始稳定阶段用高度 P 控制而非 vz=0, 防止模式切换时跌落
-像素伺服: errPx → bodyFrame velocity → NED velocity
-世界坐标兜底: 视觉丢失 >0.5s → 导航到 SCAN 地图坐标
+目标匹配: 取画面中心最近检测 (距中心 <600px), 无世界坐标投影
+像素伺服: PID(kp=0.98, ki=0.15) → bodyFrame velocity → NED velocity
 收敛条件: 滑动窗口 20帧中≥4帧 pixelErr<40px (1.0s, 容忍80%丢帧)
 失败: 丢失 >5s 或超时 30s → 返回 SELECT
 ```

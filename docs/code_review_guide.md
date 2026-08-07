@@ -98,8 +98,8 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 // CENTER: velocity 模式像素伺服, cfg_.approachAlt 保持高度
 // DESCEND: 从 cfg_.approachAlt 降至 cfg_.dropAlt (1.8m), 继承 CENTER PID
 
-// 控制分流:
-// 有像素: 像素伺服 (body-frame velocity)
+// 目标匹配: 取画面中心最近的检测 (距中心 <600px)
+// 不再用 worldToPixel 投影世界坐标, 消除 SCAN 坐标偏差导致的检测丢弃
 // 无像素 >0.5s: 世界坐标兜底 (导航到 SCAN 地图坐标)
 // 视觉丢失 >5s (DESCEND) / >5s (CENTER): 放弃本目标
 
