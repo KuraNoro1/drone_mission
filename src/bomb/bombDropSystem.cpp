@@ -43,7 +43,7 @@ void BombDropSystem::reset() {
     phase_ = Phase::SCAN; dropCount_ = 0; droppedSides_.clear();
     targetMap_.clear(); currentTargetIdx_ = -1;
     scanOriginN_ = 0; scanOriginE_ = 0;
-    lastHasPix_ = false; 
+    rescanCount_ = 0; lastHasPix_ = false; 
 }
 
 DroneState BombDropSystem::getDroneState() const {
@@ -186,48 +186,38 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
             }
             case Phase::SELECT:
                 if (!selectNextTarget()) {
-                    log("All mapped targets exhausted, re-scanning...");
-                    if (!flyToScanOrigin()) {
-                        log("Failed to return to scan origin, abort");
-                        result.timedOut = true;
-                        return result;
-                    }
-                    double originalSearchAlt = cfg_.searchAlt;
-                    double newSearchAlt = originalSearchAlt + 0.5;
-                    cfg_.searchAlt = newSearchAlt;
-                    log("Temporary re-scan height set to " + std::to_string(newSearchAlt) + "m");
-
-                    auto ned = link_.nedPosition();
-                    if (!offboard_.startPositionModeAt(static_cast<float>(ned.northM),
-                                                       static_cast<float>(ned.eastM),
-                                                       static_cast<float>(-newSearchAlt),
-                                                       initYaw_)) {
-                        log("Failed to climb for re-scan");
-                        cfg_.searchAlt = originalSearchAlt;
-                        result.timedOut = true;
-                        return result;
-                    }
-                    auto tClimb = steady_clock::now();
-                    while (duration<double>(steady_clock::now() - tClimb).count() < 10.0) {
-                        offboard_.setPositionNed(static_cast<float>(ned.northM),
-                                                 static_cast<float>(ned.eastM),
-                                                 static_cast<float>(-newSearchAlt),
-                                                 initYaw_);
-                        double alt = link_.altitude();
-                        if (std::abs(alt - newSearchAlt) < 0.3) break;
-                        sleep_for(milliseconds(200));
-                    }
-
-                    if (!scanForTargets(8.0)) {
-                        log("Re-scan found nothing, abort");
-                        cfg_.searchAlt = originalSearchAlt;
-                        result.timedOut = true;
-                        return result;
-                    }
-                    cfg_.searchAlt = originalSearchAlt;
-
-                    if (!selectNextTarget()) {
-                        log("Re-scan still no targets");
+                    if (rescanCount_ == 0) {
+                        rescanCount_++;
+                        log("All mapped targets exhausted, re-scanning...");
+                        if (!flyToScanOrigin()) {
+                            log("Failed to return to scan origin, abort");
+                            result.timedOut = true;
+                            return result;
+                        }
+                        // 右移 1.5m 获取新视角, 10s 扫描增加世界坐标采样
+                        double yawRad = static_cast<double>(initYaw_) * M_PI / 180.0;
+                        double offN = -std::sin(yawRad) * 1.5;
+                        double offE =  std::cos(yawRad) * 1.5;
+                        double rn = scanOriginN_ + offN, re = scanOriginE_ + offE;
+                        log("Re-scan offset: (" + std::to_string(rn).substr(0,5) + "," +
+                            std::to_string(re).substr(0,5) + ")");
+                        if (!flyToScanPoint(rn, re)) {
+                            log("Failed to reach re-scan point");
+                            result.timedOut = true;
+                            return result;
+                        }
+                        if (!scanForTargets(10.0)) {
+                            log("Re-scan found nothing, abort");
+                            result.timedOut = true;
+                            return result;
+                        }
+                        if (!selectNextTarget()) {
+                            log("Re-scan still no targets");
+                            result.timedOut = true;
+                            return result;
+                        }
+                    } else {
+                        log("Rescan exhausted, no more targets");
                         result.timedOut = true;
                         return result;
                     }
@@ -279,11 +269,13 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
     auto t0 = steady_clock::now();
 
     // 像素聚类: 按位置而非YOLO标签跟踪
-    struct ClusterTrack { double cx, cy; std::map<int, int> idVotes; int stableFrames; };
+    struct ClusterTrack { double cx=0, cy=0; std::map<int,int> idVotes;
+                          int stableFrames=0; double sumN=0, sumE=0; int worldSamples=0; };
     std::map<int, ClusterTrack> clusters;
     int nextClusterId = 0;
     const double CLUSTER_RADIUS = 50.0;
     const int STABLE_FRAMES = 3;
+    const int MIN_WORLD_SAMPLES = 3;
 
     if (!offboard_.isActive()) {
         auto ned = link_.nedPosition();
@@ -345,12 +337,8 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             cl.cx = nCx; cl.cy = nCy;
             for (const auto& d : dets) cl.idVotes[d.bucketId]++;
 
-            // 稳定后添加地图
+            // 稳定后累积世界坐标 (多帧平均消除姿态抖动)
             if (cl.stableFrames >= STABLE_FRAMES) {
-                int bestId = 0, bestV = 0;
-                for (const auto& [id, v] : cl.idVotes)
-                    if (v > bestV) { bestV = v; bestId = id; }
-
                 double alt = link_.altitude();
                 double yawRad = correctedYawDeg() * M_PI / 180.0;
                 double rollRad = link_.attitudeRollDeg() * M_PI / 180.0;
@@ -358,23 +346,12 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
                 WorldTarget wt = pixelToWorld(cl.cx, cl.cy, 0, intrinsics_, extrinsics_,
                                                alt, rollRad, pitchRad, yawRad, ned.northM, ned.eastM);
                 if (wt.valid) {
-                    // 坐标边界检查: 相对于扫描时无人机位置, 限制在±20m范围内
                     double maxRange = 20.0;
-                    if (std::abs(wt.north - ned.northM) > maxRange ||
-                        std::abs(wt.east  - ned.eastM)  > maxRange) {
-                        continue; // 出界, 跳过
-                    }
-                    bool dup = false;
-                    for (const auto& e : targetMap_)
-                        if (std::hypot(wt.north - e.world.north, wt.east - e.world.east) < 0.5)
-                            { dup = true; break; }
-                    if (!dup) {
-                        MapEntry entry{wt, bestId, bestId * 1.0, false};
-                        targetMap_.push_back(entry);
-                        log("  Map: 桶" + std::string(bucketLabel(bestId)) +
-                            " @(" + std::to_string(wt.north).substr(0,5) + "," +
-                            std::to_string(wt.east).substr(0,5) + ") votes=" +
-                            std::to_string(bestV));
+                    if (std::abs(wt.north - ned.northM) < maxRange &&
+                        std::abs(wt.east  - ned.eastM)  < maxRange) {
+                        cl.sumN += wt.north;
+                        cl.sumE += wt.east;
+                        cl.worldSamples++;
                     }
                 }
             }
@@ -387,6 +364,29 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             else ++it;
 
         sleep_for(milliseconds(100));
+    }
+
+    // ── 扫描结束: 多帧平均世界坐标建图 ──
+    for (const auto& [cid, cl] : clusters) {
+        if (cl.worldSamples < MIN_WORLD_SAMPLES) continue;
+
+        int bestId = 0, bestV = 0;
+        for (const auto& [id, v] : cl.idVotes)
+            if (v > bestV) { bestV = v; bestId = id; }
+
+        WorldTarget wt{true, cl.sumN / cl.worldSamples, cl.sumE / cl.worldSamples};
+
+        bool dup = false;
+        for (const auto& e : targetMap_)
+            if (std::hypot(wt.north - e.world.north, wt.east - e.world.east) < 0.5)
+                { dup = true; break; }
+        if (!dup) {
+            targetMap_.push_back({wt, bestId, bestId * 1.0, false});
+            log("  Map: 桶" + std::string(bucketLabel(bestId)) +
+                " @(" + std::to_string(wt.north).substr(0,5) + "," +
+                std::to_string(wt.east).substr(0,5) + ") votes=" +
+                std::to_string(bestV) + " samples=" + std::to_string(cl.worldSamples));
+        }
     }
 
     log("Scan done: " + std::to_string(targetMap_.size()) + " targets");
@@ -552,7 +552,7 @@ bool BombDropSystem::centerAboveTarget() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-    // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
+    // ── 水平控制: 像素伺服 (视觉丢失时原地悬停) ──
         double vx = 0, vy = 0;
         if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
@@ -564,24 +564,6 @@ bool BombDropSystem::centerAboveTarget() {
             double yawRad = correctedYawDeg() * M_PI / 180.0;
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-        }
-        // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
-        if (!hasPix && sincePix > 0.5) {
-            const auto& t = targetMap_[currentTargetIdx_].world;
-            double errN = t.north - ds.north;
-            double errE = t.east  - ds.east;
-            double distW = std::hypot(errN, errE);
-            if (distW > 0.3) {
-                double kWorld = 0.35;
-                double wvx = kWorld * errN;
-                double wvy = kWorld * errE;
-                double wvMag = std::hypot(wvx, wvy);
-                double wMax = cfg_.maxVelXY * 0.35;
-                if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
-                double w = std::min(1.0, (sincePix - 0.5) / 2.0);
-                vx = vx * (1.0 - w) + wvx * w;
-                vy = vy * (1.0 - w) + wvy * w;
-            }
         }
         // ── 垂直控制 ──
         double vz = cfg_.kpZ * (ds.alt - cfg_.approachAlt);
@@ -695,7 +677,7 @@ bool BombDropSystem::descendAndDrop() {
             confidence = 1.0 - frac * (1.0 - CONF_MIN);
         }
 
-        // ── 水平控制: 像素伺服 → 世界坐标兜底 ──
+        // ── 水平控制: 像素伺服 (视觉丢失时原地悬停) ──
         double vx = 0, vy = 0;
         if (hasPix && confidence > 0.01) {
             double errU = (pixCx - cx) / cx;
@@ -708,25 +690,6 @@ bool BombDropSystem::descendAndDrop() {
             vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
             vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
         }
-        // 世界坐标兜底: 视觉丢失>0.5s后, 导航到SCAN映射的世界坐标
-        if (!hasPix && sincePix > 0.5) {
-            const auto& t = targetMap_[currentTargetIdx_].world;
-            double errN = t.north - ds.north;
-            double errE = t.east  - ds.east;
-            double distW = std::hypot(errN, errE);
-            if (distW > 0.3) {
-                double kWorld = 0.35;
-                double wvx = kWorld * errN;
-                double wvy = kWorld * errE;
-                double wvMag = std::hypot(wvx, wvy);
-                double wMax = cfg_.maxVelXY * 0.35;
-                if (wvMag > wMax) { wvx = wvx / wvMag * wMax; wvy = wvy / wvMag * wMax; }
-                double w = std::min(1.0, (sincePix - 0.5) / 2.0);
-                vx = vx * (1.0 - w) + wvx * w;
-                vy = vy * (1.0 - w) + wvy * w;
-            }
-        }
-
         double maxVel = cfg_.maxVelXY * 0.5;
         double vMag = std::hypot(vx, vy);
         if (vMag > maxVel && vMag > 0.001) {
@@ -777,10 +740,10 @@ bool BombDropSystem::descendAndDrop() {
             return false;
         }
 
-        if (reachedDropAlt && hasPix) {
-            double pixelErr = std::hypot(pixCx - cx, pixCy - cy);
+        if (reachedDropAlt) {
+            double pixelErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
             double velMag = std::hypot(ds.vx, ds.vy);
-            bool pixOk = pixelErr < DROP_TOL_PX;
+            bool pixOk = hasPix && pixelErr < DROP_TOL_PX;
             bool velOk = velMag < cfg_.velZeroTol;
             bool altOk = std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
             bool dropOk = pixOk && velOk && altOk;

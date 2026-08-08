@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-统一视觉检测 v3 — 侦察区 HSV 颜色搜索为主 + 定点突发跟踪 + 稳定ID
+统一视觉检测 v4 — 延迟优先：侦察区仅 WebSocket 视频，投放/H 实时坐标
 ================================================================
+v4 核心改动:
+  - 侦察区完全停止 YOLO/HSV/跟踪推理，只覆盖式推送最新 WebSocket 视频帧
+  - 投放区与 H 区继续实时输出像素中心坐标，所有队列只保留最新数据
+  - 延迟优先：投放隔帧推理、禁用梯度、降低同步日志频率、减少图像复制
+  - 保留 v3.9 H 丢失窗口逐帧低阈值重检与自适应搜索半径
+  - C++ 管道路径和数据协议保持不变；recon_pipe 保留但侦察区不再产生识别结果
+
+历史版本说明:
 v2 → v3 改动 (侦察区):
   - ✅ 定点突发跟踪器 BucketTrack: 悬停帧按中心距离关联成稳定ID,
         颜色/空桶连续确认 RECON_CONFIRM_FRAMES 帧才切换输出 (滞回/防抖)
@@ -26,8 +34,9 @@ v2 → v3 改动 (侦察区):
   - ✅ 模型切换反序: process_h 先卸载桶模型释放显存, 再加载 H 模型
         (原顺序: 加载H时桶模型仍占显存 → 慢+抖动 → 模型就绪时飞机已飞过H,
          造成"只检测到一次就丢失")
-  - ✅ H 三帧丢失滤波: 连续 H_LOST_CONFIRM(3) 帧未检出才判真丢失,
+  - ✅ H 丢失滤波: 连续 H_LOST_CONFIRM(5, v3.6 由3调大) 帧未检出才判真丢失,
         单帧抖动/偶发误检不误发 None → 控制端不误返航
+        (v3.6 修复: 真丢失后管道发 None, 不再补位旧坐标 — C++ 端才能进 lost-tracking)
   - ✅ 丢失后扩大搜索: 首帧未检出用低阈值 H_CONF_LOW(0.15) 重检,
         位置在上次检测 H_SEARCH_RADIUS(200px) 邻域内才接受 (防远距离误检)
   - ✅ H 阈值 0.5→0.35: 降落视角 H 小/畸变/运动模糊 conf 偏低, 多捞回边缘帧
@@ -58,9 +67,32 @@ v2 → v3 改动 (侦察区):
         → 不再稀释 pct、不再反光染成标签色; 分母=中心圆面积不被灌水;
         白色去主导: 白色最高但有其他显著色时, 提第一个非白非黑显著色为主色;
         RECON_HSV_COUNT_WHITE=True: 白色参与判色 (红白标识 → red:xx,white:xx);
-        RECON_HSV_COUNT_BLACK=False: 黑色当文字/分隔不参与;
+        RECON_HSV_COUNT_BLACK=True: 黑色参与判色 (腐蚀品/刺激性需要;
+        红底易燃的黑字也计入黑色, 但红+黑分支仍判易燃, 不影响);
         RECON_HSV_NEVER_COUNT={'gray'}: 灰永不参与; 纯白中心(无其他色)=空桶
         (白色绝不参与全帧搜索, 防白桶壁/地面误报)
+  v3.7 (侦察区实测修复 — 放2桶报13桶 / 自燃漏检 / 误报遇湿易燃):
+  - ✅ 标签碎片聚类: find_color_buckets 每色色块先按空间邻近聚类再外扩,
+        反光/抗锯齿拆开的同标签碎片不再各生成一个候选框 (原合并 IoU 救不回)
+  - ✅ 逐色低饱和回退: 某颜色正常S扫不到时单独 S≥8/V≥40 重扫,
+        不再要求"整帧全空"才回退 → 黄标够亮时红标也能被扫到 (自燃物品不再漏检)
+  - ✅ 轨道上限 MAX_BUCKETS: 跨帧碎片框累积不再让输出膨胀到十几个
+  - ✅ 附带修复: 自燃物品红底没检到时, 其白半边反射天空蓝会被误判为蓝色
+        (遇湿易燃物品) — 红底检到后该桶正确锚定在红上, 蓝误报消失
+  v3.7.1 (正上方悬停自燃 → 生物危害回归修复):
+  - ✅ 白色双计防护收窄: 只排除"红"(红底抗锯齿污染白色), 不再排除黄/蓝 —
+        v3.6 排除黄/蓝把自燃/放射性的白半边(暖光反射淡黄/蓝, S∈[12,30])
+        剔除出白色 → 白半边只算成黄 → 纯黄 → 生物危害 (自燃上方实测)
+  - ✅ identify_label_name: 红在而白/黑均不在 → 返回易燃,
+        堵住"红+反射黄 → 单色黄 → 生物危害"的回落漏洞
+  - ✅ [RECON SUMMARY] 附带原始颜色占比 (诊断: 判断"生物危害"是纯黄还是红+白)
+  v3.7.2 (红色整帧识别不到修复):
+  - ✅ 低饱和回退 V 死区修复: 回退轮 V 下限 40→18 — 原设计只放宽 S 却抬高 V,
+        制造死区 (S∈[8,12] 且 V∈[18,40] 正常轮与回退轮都漏); 红颜料发灰又偏暗,
+        正好掉进死区 → 红色整帧识别不到 (自燃物品上方实测返回生物危害)
+  - ✅ 回退 S 8→6 (现场实测红色"更灰一点点", S∈[6,8] 纳入回退)
+  - ✅ 红色探针 _probe_red: 每 20 帧打印全帧红像素 S≥12/S≥6 两档计数,
+        直接定位红色是发灰(S)、发暗(V) 还是色相偏
 
 架构前提 (与飞控约定):
   - C++ 只在到达侦察定点悬停稳定后才发 RECON_SCAN → 收到即信任"已在定点"
@@ -69,13 +101,13 @@ v2 → v3 改动 (侦察区):
 
 任务模式:
   - 投放区: YOLO 桶检测 → /tmp/vision_pipe (二进制)
-  - 侦察区: 定点突发跟踪 + 桶口椭圆 + Lab K-means → /tmp/recon_pipe (文本)
+  - 侦察区: 不做识别，仅通过 WebSocket 覆盖式发送最新原始视频帧
   - 返航降落: YOLO H 检测 → /tmp/h_pipe (文本)
   - 读取 /tmp/mission_cmd 自动切换 (C++ 状态通知)
   - 仿真模式自动启动 gz_gst_bridge 相机桥
 
 用法:
-  python3 detector_unified_v3.py [--sim] [--display]
+  python3 detector_unified_v4.py [--sim] [--display]
 ================================================================
 """
 
@@ -87,10 +119,10 @@ import sys
 import time
 import queue
 import threading
-import itertools
 import numpy as np
-from collections import defaultdict, Counter
 from datetime import datetime
+import asyncio
+import websockets
 
 # ─────────────────────────── 配置 ───────────────────────────
 _USER = os.environ.get('SUDO_USER', 'hy')
@@ -102,6 +134,13 @@ VISION_PIPE = "/tmp/vision_pipe"
 RECON_PIPE  = "/tmp/recon_pipe"
 H_PIPE      = "/tmp/h_pipe"
 CMD_PIPE    = "/tmp/mission_cmd"
+
+# ── WebSocket 推送配置 (v3.8: 侦察区实时标注帧推送) ──
+WS_HOST = "0.0.0.0"
+WS_PORT = 8765
+# v4: 侦察区高质量（需识别标签颜色细节），投放/降落区标准质量（只需看到目标位置）
+RECON_WS_JPEG_QUALITY = 85  # 侦察区高质量 (单帧 ~85KB)
+WS_JPEG_QUALITY = 60         # 投放/降落/启动区标准质量 (单帧 ~40KB)
 
 STREAM_URL = "tcp://127.0.0.1:5000"
 IMG_SIZE = 416
@@ -148,135 +187,12 @@ ALT_MAX_AGE = 1.0
 
 MAX_BUCKETS = 5
 
-# ── 侦察区 v6: 全帧 HSV 颜色搜索为主 (原 scripts/detector_recon.py 方案) ──
-#   正上方俯视时 YOLO 认不出桶、白环兜底要求"白色圆形大块"又常失败 → 整帧 None。
-#   颜色标签是正上方唯一可靠信号 → 直接全帧 HSV 找彩色块, 不依赖桶形状。
-RECON_HSV_MIN_AREA = 80         # 全帧找色块: 最小连通面积 (排除小噪点)
-RECON_HSV_EXPAND_RATIO = 2.5    # 色块中心 → 外扩成候选框的倍率 (包住白边桶顶)
-RECON_HSV_MARGIN = 15           # 候选框内缩边缘 (去框线/背景干扰)
-RECON_HSV_IOU_THRESH = 0.3      # YOLO框 与 HSV色块框 的合并重叠阈值
-RECON_HSV_BLOB_MIN_AREA = 120   # 占比分析: 单个色斑最小面积 (MARKER_MIN_AREA)
-RECON_HSV_PCT_MIN = 0.5         # 占比分析: 颜色占比低于此值忽略 (%)
-
-# ── v3.4: 低饱和度回退 (3.5m 标签发灰, S 可能低于正常阈值) ──
-RECON_HSV_FALLBACK_S = 8          # 回退轮饱和度下限 (正常 S=12)
-RECON_HSV_FALLBACK_V_MIN = 40     # 回退轮 V 下限 (避开阴影)
-RECON_HSV_FALLBACK_MIN_AREA = 150 # 回退轮全帧搜索最小色块面积 (压噪)
-
-# ── v3.4: 标识配色 / 白壁污染处理 (v3.5 吸收 v2 中心掩码思路) ──
-#   标识是"红白配色": 白参与判色, 黑不参与(当文字/分隔)。
-#   白只参与判色, 绝不参与全帧搜索(白桶壁/地面会全误报)。
-RECON_HSV_COUNT_WHITE = True      # True=白色参与判色 (标识含白色)
-                                  # False=白当背景, 不输出
-RECON_HSV_COUNT_BLACK = True      # True=黑色参与判色 (腐蚀品/刺激性需要)
-                                  # False=黑当文字/分隔, 不输出
-RECON_HSV_NEVER_COUNT = {'gray'}  # 永不参与判色的颜色 (灰=阴影/发灰)
-# v3.5: 中心掩码 (吸收 v2 detector_recon_v2.py) — 判色只统计 ROI 中心圆, 排除桶壁/外圈
-RECON_HSV_CENTER_RATIO = 0.8      # 中心圆直径占 ROI 短边的比例 (0.8=保留中心80%)
-
-# 全帧 HSV 颜色搜索的颜色范围 (BGR→HSV, OpenCV H:0-180 S/V:0-255)
-COLOR_RANGES = {
-    # v3.4: 3.5m 标签发灰, S 下限 20→12, V 下限 20→18 (回退见 RECON_HSV_FALLBACK_*)
-    'red':     ((0, 12, 18),   (10, 255, 255)),
-    'red2':    ((160, 12, 18), (180, 255, 255)),
-    'orange':  ((10, 12, 18),  (20, 255, 255)),
-    'yellow':  ((25, 12, 18),  (35, 255, 255)),
-    'green':   ((40, 12, 18),  (80, 255, 255)),
-    'blue':    ((100, 12, 18), (130, 255, 255)),
-    'purple':  ((135, 12, 18), (160, 255, 255)),
-    'black':   ((0, 0, 0),     (180, 255, 30)),
-    'gray':    ((0, 0, 30),    (180, 30, 70)),
-    'white':   ((0, 0, 70),    (180, 30, 255)),
-}
-# 全帧搜索定位色: 白/灰/黑永不用于定位候选 (白桶壁/地面会误报), 只靠饱和彩色定位
-RECON_HSV_IGNORE_COLORS = {'white', 'gray', 'black'}
-# 草地测试期间禁用绿色标签 (草地=绿色, 不关会全场误判绿色桶)。
-# 比赛场地是水泥地(非草地), 会放绿色桶标识 → 赛前恢复为 set() 即可启用绿色。
-RECON_HSV_SKIP_COLORS = {'green'}
-
-# ── v3: 定点突发跟踪参数 (保留) ──
-RECON_MATCH_DIST = 60.0       # 帧间桶中心关联最大距离 (全帧像素, 悬停足够)
-RECON_BUCKET_LOST_MAX = 4     # 桶连续丢失 N 帧后删除轨道 (悬停短暂遮挡不丢)
-RECON_CONFIRM_FRAMES = 2      # 状态连续确认 N 帧才切换输出 (滞回/防抖)
-RECON_FOLD_UNKNOWN_TO_EMPTY = True  # True=unknown折叠为empty, 与v2协议一致
-
-# ── v3.2: 隔帧重检测 (Jetson 4GB CPU 省算力) ──
-RECON_INFER_EVERY = 3           # 悬停中每 N 帧才跑一次重检测 (YOLO+HSV搜索)
-                                # 中间帧复用上次稳定结果照常输出 (悬停场景桶几乎不动)
-                                # N=3 起步, 实测卡可调大 (5), 流畅可调小 (2)
-
-COLOR_NAMES_CN = {
-    'red': '红色', 'orange': '橙色', 'yellow': '黄色',
-    'green': '绿色', 'blue': '蓝色', 'purple': '紫色',
-    'white': '白色', 'black': '黑色',
-}
-
-# ── 侦察区标识名称映射表 ──
-LABEL_MAP = {
-    'orange': '爆炸品',
-    'green':  '不燃气体',
-    'red':    '易燃',
-    'blue':   '遇湿易燃物品',
-    'yellow': '生物危害',
-}
-
-def identify_label_name(colors_dict):
-    """
-    根据 HSV 色块比例映射到危险品标识名称.
-
-    规则 (易燃 = 红底黑字, 黑字参与判色不影响红底主色):
-      - 易燃: 红底黑字 → 红+黑同时出现即判易燃
-      - 自燃物品: 红+白对角分割, 红>20% 且 白≥15% (两者都显著)
-      - 有毒品: 白底红边, 红≤20% (白主导)
-      - 红底 + 少量白 (反光/残留, 白<15%) → 仍判易燃, 不被对角分割误吞
-      - 放射性物品: 黄+白对角分割
-      - 腐蚀品: 上白下黑对角, 黑>25%
-      - 刺激性: 白底黑边黑字, 黑 5%~25%
-      - 单色底标识: 直接按占比最高的颜色映射
-      - 纯白色且无其他显著色 → empty (空桶)
-      - 绿色被 SKIP 期间 → unknown (草地测试时不燃气体检测不到)
-    """
-    if not colors_dict:
-        return 'empty'
-
-    colors_set = set(colors_dict.keys())
-    top_color = max(colors_dict, key=colors_dict.get)
-
-    # ── 红系组合 (先于黑+白: 有毒品/自燃带黑字也不能被误判成刺激性) ──
-    if 'red' in colors_set:
-        if 'white' in colors_set:
-            red_pct = colors_dict.get('red', 0)
-            white_pct = colors_dict.get('white', 0)
-            if red_pct <= 20:
-                return '有毒品'          # 白底红边, 红占比低
-            if white_pct >= 15:
-                return '自燃物品'        # 红白对角分割, 两者都显著
-            # 白占比小 → 红底上的白色反光/残留, 不是对角分割 → 易燃
-            return '易燃'
-        if 'black' in colors_set:
-            return '易燃'                # 红底黑字
-
-    # ── 其他多色组合标识 ──
-    if 'yellow' in colors_set and 'white' in colors_set:
-        return '放射性物品'
-
-    if 'black' in colors_set and 'white' in colors_set:
-        black_pct = colors_dict.get('black', 0)
-        if black_pct > 25:
-            return '腐蚀品'
-        elif black_pct > 5:
-            return '刺激性'
-        # black 很少 → 可能是其他标识的文字, 继续走单色逻辑
-
-    # ── 单色标识 ──
-    if top_color in LABEL_MAP:
-        return LABEL_MAP[top_color]
-
-    # 纯白且无其他显著色 → 空桶
-    if top_color == 'white' and len(colors_set) == 1:
-        return 'empty'
-
-    return 'unknown'
+# v4: 投放区和 H 区每个最新帧都推理；只限制 WebSocket 编码频率。
+DROP_LOG_EVERY = 15
+H_LOG_EVERY = 15
+# 侦察区仍按每个最新相机帧推送；检测区约每2帧推送一帧画面。
+DROP_WS_EVERY = 2
+H_WS_EVERY = 2
 
 
 THRESH_15_20 = 30
@@ -318,8 +234,65 @@ def parse_mission_state(state_str):
 #  侦察区 v6: 全帧 HSV 颜色搜索为主 + 定点突发跟踪 (原 scripts 方案)
 # ═══════════════════════════════════════════════════════════════
 
+# v4: 侦察区不再调用以下历史实现；保留文本仅供现场参数追溯。
+'''
+def _cluster_rects(rects, ratio=RECON_HSV_EXPAND_RATIO,
+                   extra=RECON_HSV_CLUSTER_RATIO):
+    """同一颜色、空间相邻的色块合并成一个候选 (同标签碎片去重).
+
+    v3.7 修复: 标签碎片(反光/抗锯齿拆开)间距常超过 2.5×色块,
+    原逻辑每个碎片独立外扩 → 同一标签被拆成多个框 (侦察区"放2个桶报13个")。
+    判据: 两色块的候选框按 extra 倍率外扩后重叠 → 视为同一标签, 先合并原 bbox。
+    """
+    boxes = [list(r) for r in rects]  # [x, y, w, h]
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(boxes):
+            j = i + 1
+            while j < len(boxes):
+                a, b = boxes[i], boxes[j]
+                pa = max(a[2], a[3]) * ratio * extra / 2
+                pb = max(b[2], b[3]) * ratio * extra / 2
+                if (a[0] - pa < b[0] + b[2] + pb and
+                        b[0] - pb < a[0] + a[2] + pa and
+                        a[1] - pa < b[1] + b[3] + pb and
+                        b[1] - pb < a[1] + a[3] + pa):
+                    x1 = min(a[0], b[0]); y1 = min(a[1], b[1])
+                    x2 = max(a[0] + a[2], b[0] + b[2])
+                    y2 = max(a[1] + a[3], b[1] + b[3])
+                    boxes[i] = [x1, y1, x2 - x1, y2 - y1]
+                    boxes.pop(j)
+                    changed = True
+                else:
+                    j += 1
+            i += 1
+    return [(x, y, w, h) for x, y, w, h in boxes]
+
+
+def _scan_color(hsv, color_name, min_area, s_min, v_min):
+    """对单色做 inRange + 形态学, 返回通过面积阈值的连通域 bbox 列表."""
+    lo, hi = _color_range_lo(color_name, s_min, v_min)
+    mask = cv2.inRange(hsv, lo, hi)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)  # v3.7.3 草地测试: 1→2 打碎草地细纹理
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    blobs = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        blobs.append((x, y, w, h))
+    return blobs
+
+
 def find_color_buckets(frame, min_area=RECON_HSV_MIN_AREA,
-                       s_min=None, v_min=None):
+                       s_min=None, v_min=None,
+                       per_color_fallback=False):
     """
     全帧 HSV 颜色搜索 — 侦察区正上方主检测。
 
@@ -327,9 +300,14 @@ def find_color_buckets(frame, min_area=RECON_HSV_MIN_AREA,
     不依赖"桶的形状", 正上方俯视 YOLO 认不出桶时也能直接读到标签色
     (原 scripts/detector_recon.py 方案)。
 
-    低饱和回退: 传 s_min/v_min 时覆盖 COLOR_RANGES 的 S/V 下限重扫。
+    每色独立搜索 → 碎片按空间邻近聚类 (_cluster_rects) → 外扩成候选框。
+    (修复: 反光/抗锯齿把同一标签拆成多个框 → 放2个桶却报13个)
 
-    返回: [(x1,y1,x2,y2), ...]  按面积降序, 上限 MAX_BUCKETS
+    per_color_fallback=True: 某颜色正常 S 扫不到时, 用低饱和 (S≥8/V≥40)
+    对该颜色单独重扫 (3.5m 标签发灰)。旧逻辑只在"整帧全空"才回退,
+    会漏掉"黄色够亮、红色发灰"的混合场景 → 自燃物品(红)整帧漏检。
+
+    返回: [(x1,y1,x2,y2), ...]
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     boxes = []
@@ -338,18 +316,11 @@ def find_color_buckets(frame, min_area=RECON_HSV_MIN_AREA,
             continue
         if color_name in RECON_HSV_SKIP_COLORS:
             continue
-        lo, hi = _color_range_lo(color_name, s_min, v_min)
-        mask = cv2.inRange(hsv, lo, hi)
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-            x, y, w, h = cv2.boundingRect(cnt)
+        blobs = _scan_color(hsv, color_name, min_area, s_min, v_min)
+        if not blobs and per_color_fallback:
+            blobs = _scan_color(hsv, color_name, RECON_HSV_FALLBACK_MIN_AREA,
+                                RECON_HSV_FALLBACK_S, RECON_HSV_FALLBACK_V_MIN)
+        for (x, y, w, h) in _cluster_rects(blobs):
             center_x = x + w // 2
             center_y = y + h // 2
             bucket_size = int(max(w, h) * RECON_HSV_EXPAND_RATIO)
@@ -459,7 +430,9 @@ def analyze_color_proportions(roi, min_area=RECON_HSV_BLOB_MIN_AREA,
       1. 只在 ROI 中心圆 (RECON_HSV_CENTER_RATIO) 内统计 → 桶壁/外圈不入
       2. 分母 = 中心圆面积 → 不被整ROI/桶壁灌水
       3. 白/黑/灰参与由 _should_count_color 控制 (红白配色: 白参与, 黑/灰不参与)
-      4. 白色去主导: 白色占最高但有其他显著色时, 提第一个非白非黑显著色为主色
+      4. v3.6 双计防护: 白色掩码排除已在饱和色(红橙黄绿蓝紫)内命中的像素 —
+         red(S≥12) 与 white(S≤30) 在 S∈[12,30] 重叠, 反光/抗锯齿的"浅红"像素
+         会同时计入红和白, 抬升 white% → 易燃(红底)可能被误判成自燃物品
       5. 保留低饱和回退: 传 s_min/v_min 覆盖 S/V 下限重判
 
     返回: {color_name: pct, ...} 或 {} (无标签 → 空桶)
@@ -473,7 +446,8 @@ def analyze_color_proportions(roi, min_area=RECON_HSV_BLOB_MIN_AREA,
     if total_pixels == 0:
         return {}
 
-    color_area_map = defaultdict(int)
+    # 先算各色掩码 (不开孔, 供白色双计防护合并饱和色)
+    color_masks = {}
     for color_name in COLOR_RANGES:
         if not _should_count_color(color_name):
             continue
@@ -482,6 +456,25 @@ def analyze_color_proportions(roi, min_area=RECON_HSV_BLOB_MIN_AREA,
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        color_masks[color_name] = mask
+
+    # v3.7.1 双计防护(收窄): 白色只排除"红" — 红底(易燃)抗锯齿/反光的
+    #   "浅红"像素(S∈[12,30])会同时命中红和白, 抬升 white% → 易燃误判成自燃物品。
+    #   不能排除黄/蓝等: 自燃/放射性的白半边在暖光下反射黄/蓝(S∈[12,30]),
+    #   被排除后白半边只算成"黄/蓝" → 自燃(红+白)被误判成生物危害(纯黄)。
+    #   实测: 正上方悬停自燃物品 → 返回生物危害, 即此回归所致。
+    if 'white' in color_masks:
+        redish = None
+        for cn in ('red', 'red2'):
+            if cn in color_masks:
+                redish = (color_masks[cn] if redish is None
+                          else cv2.bitwise_or(redish, color_masks[cn]))
+        if redish is not None:
+            color_masks['white'] = cv2.bitwise_and(
+                color_masks['white'], cv2.bitwise_not(redish))
+
+    color_area_map = defaultdict(int)
+    for color_name, mask in color_masks.items():
         mask = cv2.bitwise_and(mask, mask, mask=center_mask)
         area = cv2.countNonZero(mask)
         if area >= min_area:
@@ -634,11 +627,16 @@ def update_tracks(tracks, dets):
             t.feed(d['state'])
             out.append(t)
 
-    return out
+    # v3.7: 轨道数上限 — 跨帧碎片框持续累积会让输出爆炸(放2桶报13),
+    #   按 x 保留最左 MAX_BUCKETS 个 (位置序号即按 x, 与输出一致)
+    out.sort(key=lambda t: t.cx)
+    return out[:MAX_BUCKETS]
 
+
+'''
 
 # ═══════════════════════════════════════════════════════════════
-#  投放区: 桶直径分类 (不变)
+#  投放区: 桶直径分类
 # ═══════════════════════════════════════════════════════════════
 
 def classify_bucket_id(pixel_width, cx, cy):
@@ -720,6 +718,7 @@ save_queue = queue.Queue(maxsize=10)
 vision_pipe_queue = queue.Queue(maxsize=1)
 recon_pipe_queue  = queue.Queue(maxsize=1)
 h_pipe_queue      = queue.Queue(maxsize=1)
+ws_queue = queue.Queue(maxsize=2)  # v3.8: WebSocket 推送队列 (只保留最新1-2帧)
 
 vision_pipe_fd = None
 recon_pipe_fd  = None
@@ -739,19 +738,20 @@ bridge_proc = None
 model_switch_lock = threading.Lock()
 h_model_loading = False     # v3.3: 后台预加载 H 进行中标志 (process_h 据此跳过推理不阻塞)
 bucket_model_loading = False  # v3.3: 后台预加载桶进行中标志
+h_model_pinned = False       # v4: 一旦进入侦察区，H 模型常驻到程序退出/断电
 
-# ── v3: 侦察区定点突发跟踪器状态 ──
-recon_tracks = []              # 当前 RECON 会话的轨道列表
-recon_session_active = False   # 是否正在 RECON 会话 (用于进出清空轨道)
+# v4: 侦察区无推理状态。管道对象继续保留，确保 C++ 接口不变。
 
 
 # ── H 标识历史缓存 ──
 h_last_cx = None          # 上一次检测到的 H 中心 X
 h_last_cy = None          # 上一次检测到的 H 中心 Y
 h_last_conf = 0.0         # 上一次检测的置信度
+h_last_box = None         # v3.9: 上一次检出 H 框的宽高 (重检自适应半径用)
 h_loss_frames = 0         # 连续未检出帧数 (含滤波过渡)
 H_HISTORY_MAX = 90        # 真丢失后最多保持历史的帧数 (~3s @30fps)
-H_LOST_CONFIRM = 3        # v3.3: 连续 N 帧未检出才判真丢失 (单帧抖动/偶发误检不算)
+H_LOST_CONFIRM = 5        # v3.3: 连续 N 帧未检出才判真丢失 (单帧抖动/偶发误检不算)
+                          # v3.6: 3→5, 防抖窗口放宽 — 降落时 H 频繁短暂出画不误停伺服
 H_CONF_LOW = 0.15         # v3.3: 丢失后扩大搜索用低阈值 (捞回边缘/小/畸变 H)
 H_SEARCH_RADIUS = 200     # v3.3: 扩大搜索最大中心偏移 (px, 416输入), 防远距离误检
 
@@ -809,13 +809,15 @@ def load_bucket_model():
 
 
 def preload_bucket_model_async():
-    """v3.3: 后台线程预加载桶模型 (不阻塞推理线程)。
-
-    对称于 preload_h_model_async; 在切到投放/侦察时调用。
-    """
+    """后台线程预加载桶模型，仅在投放模式保留。"""
     def _worker():
         try:
             load_bucket_model()
+            with mode_lock:
+                m = current_mode
+            # 若加载期间已经进入侦察/返航，加载完成后立即释放。
+            if m != MissionMode.DROP:
+                maybe_unload_bucket_model()
         except Exception as e:
             print(f"[MODEL] 桶模型预加载失败: {e}")
     threading.Thread(target=_worker, daemon=True).start()
@@ -852,14 +854,19 @@ def load_h_model():
 
 
 def preload_h_model_async():
-    """v3.3: 后台线程预加载 H 模型 (不阻塞推理线程)。
+    """后台加载并预热 H 模型。
 
-    在切到 RTL 返航时调用 → 返航飞行期间完成加载, 到降落区零等待。
-    加锁防止与 process_h 的同步加载竞态。
+    v4: 首次进入侦察区后 h_model_pinned=True，H 模型不再因后续模式变化释放，
+    一直驻留到程序退出或设备断电。
     """
     def _worker():
         try:
             load_h_model()
+            with mode_lock:
+                m = current_mode
+            if (not h_model_pinned and
+                    m not in (MissionMode.RTL, MissionMode.H_LAND)):
+                maybe_unload_h_model()
         except Exception as e:
             print(f"[MODEL] H 模型预加载失败: {e}")
     threading.Thread(target=_worker, daemon=True).start()
@@ -1019,79 +1026,76 @@ def capture_worker():
 # ═══════════════════════════════════════════════════════════════
 
 def inference_worker():
-    global running, current_mode, recon_session_active
+    global running, current_mode, h_model_pinned
+    global h_loss_frames, h_last_cx, h_last_cy, h_last_conf, h_last_box
     print("推理线程已启动")
     frame_count = 0
-    prev_mode = None   # v3.3: 跟踪上次模式, 检测切换时立即管理模型
+    prev_mode = None
 
     while running:
         if raw_queue.empty():
             time.sleep(0.001); continue
-
         try:
             frame = raw_queue.get()
             frame_count += 1
-
             with mode_lock: mode = current_mode
 
-            # v3.3: 模式切换事件 → 立即切换模型 (不等第一帧推理才做)
-            #   - 切到返航/降落 (RTL/H_LAND): 立即释放桶 + 后台预加载 H
-            #       → RTL 整段返航飞行里 H 模型就绪, 到降落区零等待
-            #   - 切到投放/侦察 (DROP/RECON): 立即释放 H + 后台预加载桶
-            #   process_h/process_drop 里的同步加载保留作兜底
-            #   (若后台加载未完成, 首次推理时同步等待补足)
             if mode != prev_mode:
                 if mode in (MissionMode.RTL, MissionMode.H_LAND):
+                    if bucket_model is not None: maybe_unload_bucket_model()
+                    if h_model is None: preload_h_model_async()
+                    if prev_mode not in (MissionMode.RTL, MissionMode.H_LAND):
+                        h_loss_frames = 0
+                        h_last_cx = h_last_cy = None
+                        h_last_conf = 0.0
+                        h_last_box = None
+                    print("[MODEL] 切到返航/降落, 释放桶 + 后台预加载 H")
+                elif mode == MissionMode.DROP:
+                    if h_model is not None and not h_model_pinned:
+                        maybe_unload_h_model()
+                    if bucket_model is None:
+                        preload_bucket_model_async()
+                    if h_model_pinned:
+                        print("[MODEL] 切到投放, H 模型按常驻策略保留 + 后台预加载桶")
+                    else:
+                        print("[MODEL] 切到投放, 释放 H + 后台预加载桶")
+                elif mode == MissionMode.RECON:
+                    # v4: 到达侦察区即进入后半程模型策略：释放桶模型，
+                    # 后台加载并预热 H，随后保持 H 常驻直到程序退出/断电。
+                    h_model_pinned = True
                     if bucket_model is not None:
                         maybe_unload_bucket_model()
                     if h_model is None:
                         preload_h_model_async()
-                    print("[MODEL] 切到返航/降落, 释放桶 + 后台预加载 H")
-                elif mode in (MissionMode.DROP, MissionMode.RECON):
-                    if h_model is not None:
-                        maybe_unload_h_model()
-                    if bucket_model is None:
-                        preload_bucket_model_async()
-                    print("[MODEL] 切到投放/侦察, 释放 H + 后台预加载桶")
+                    print("[MODEL] 切到侦察, 释放桶 + 后台预加载 H；H 将常驻至断电")
                 prev_mode = mode
 
             if mode == MissionMode.RECON:
-                # v3: 进入新定点 (RECON_SCAN 只在悬停时发) → 清空上一站轨道
-                if not recon_session_active:
-                    recon_tracks.clear()
-                    recon_session_active = True
                 process_recon(frame, frame_count)
+            elif mode == MissionMode.DROP:
+                process_drop(frame, frame_count)
+            elif mode in (MissionMode.RTL, MissionMode.H_LAND):
+                process_h(frame, frame_count)
             else:
-                # 离开侦察区 → 复位会话, 下一站重新检测到达
-                recon_session_active = False
-                if mode == MissionMode.DROP:
-                    process_drop(frame, frame_count)
-                elif mode in (MissionMode.RTL, MissionMode.H_LAND):
-                    process_h(frame, frame_count)
-                else:
-                    push_display(frame)
-
-            if mode != MissionMode.RECON and USE_DISPLAY:
-                while not popup_queue.empty():
-                    try: popup_queue.get_nowait()
-                    except queue.Empty: break
-                popup_queue.put([])
+                # v4: 启动时无模式也推送原始视频流到 WebSocket
+                push_display(frame)
+                push_ws(frame, None)  # 无模式状态使用标准质量
         except Exception as e:
             print(f"[推理异常] {e}", flush=True)
-
     print("推理线程退出")
 
 
-# ── 投放区 (不变) ──
+# ── 投放区 ──
 
 def process_drop(frame, frame_count):
     global bucket_model
     if bucket_model is None:
-        # v3.3: 先释放 H 模型显存, 再加载桶模型 (加载更快更稳)
-        maybe_unload_h_model()
+        if not h_model_pinned:
+            maybe_unload_h_model()
         load_bucket_model()
 
-    results = bucket_model(frame, size=IMG_SIZE)
+    with torch.no_grad():
+        results = bucket_model(frame, size=IMG_SIZE)
     detections = results.xyxy[0].cpu().numpy()
     target_dets = detections[detections[:, 5] == 0] if len(detections) > 0 else []
 
@@ -1111,8 +1115,10 @@ def process_drop(frame, frame_count):
     if len(bucket_list) == 0:
         if frame_count % 30 == 0: print("[DROP] None")
     else:
-        for bid, cx, cy in bucket_list:
-            print(f"[DROP] bucket{bid}: ({cx:.1f}, {cy:.1f})")
+        if frame_count % DROP_LOG_EVERY == 0:
+            print("[DROP] " + ", ".join(
+                f"bucket{bid}: ({cx:.1f}, {cy:.1f})"
+                for bid, cx, cy in bucket_list))
 
     while not vision_pipe_queue.empty():
         try: vision_pipe_queue.get_nowait()
@@ -1121,6 +1127,8 @@ def process_drop(frame, frame_count):
 
     push_save(result_frame, "DROP")
     push_display(result_frame)
+    if frame_count % DROP_WS_EVERY == 0:
+        push_ws(result_frame, MissionMode.DROP)
 
 
 # ── 侦察区 (v6: HSV 颜色搜索为主 + 定点突发跟踪) ──
@@ -1167,11 +1175,13 @@ def _emit_recon_result(recon_tracks, frame, frame_count, used_backup=False):
                 state_str = "empty"
                 label = f"B{bid} [UNKNOWN]"
             else:
-                state_str = label_name
+                state_str = label_name   # 管道仍发中文标识名, 协议不变
                 sc = sorted(t.stable_colors.items(),
                             key=lambda kv: kv[1], reverse=True)
-                cn_parts = [f"{COLOR_NAMES_CN.get(c, c)}:{p:.0f}%" for c, p in sc]
-                label = f"B{bid} {label_name} ({' '.join(cn_parts)})"
+                # 显示用英文短码 (OpenCV Hershey 无中文字形, 写中文乱码)
+                en_parts = [f"{COLOR_NAMES_EN.get(c, c)}:{p:.0f}%" for c, p in sc]
+                label = (f"B{bid} {LABEL_NAMES_EN.get(label_name, label_name)} "
+                         f"({' '.join(en_parts)})")
 
         pipe_parts.append(f"{bid}:{state_str}")
 
@@ -1184,7 +1194,16 @@ def _emit_recon_result(recon_tracks, frame, frame_count, used_backup=False):
     # ── 汇总 ──
     msg = ";".join(pipe_parts) if pipe_parts else "None"
     if frame_count % 10 == 0 and pipe_parts:
-        print(f"[RECON SUMMARY] {' | '.join(pipe_parts)}")
+        # v3.7.1 诊断: 附上每个 color 轨道的原始颜色占比, 便于判断
+        # "生物危害" 是纯黄(真黄桶) 还是 红+白(自燃被误读) — 看 COLORS 即知
+        dbg = []
+        for t in active:
+            if t.stable_key == 'color':
+                sc = sorted(t.stable_colors.items(),
+                            key=lambda kv: kv[1], reverse=True)
+                dbg.append("(" + " ".join(f"{c}:{p:.1f}" for c, p in sc) + ")")
+        print(f"[RECON SUMMARY] {' | '.join(pipe_parts)}" +
+              (f"  COLORS: {dbg}" if dbg else ""))
 
     # ── 管道发送 ──
     push_recon(msg)
@@ -1209,100 +1228,35 @@ def _emit_recon_result(recon_tracks, frame, frame_count, used_backup=False):
 
     push_save(result_frame, "RECON")
     push_display(result_frame)
+    push_ws(result_frame)  # v3.8: 推送标注帧到 WebSocket
+
+
+def _probe_red(frame):
+    """调试 (v3.7.2): 全帧红像素计数 — 定位红标为何识别不到.
+
+    分 S≥12 / S≥6 两档 (V 都≥18, 对应正常轮 S12 / 回退轮 S6)。判断:
+      - S12≈0 且 S6>0  → 红色只是发灰 (S 掉到 6-12), 已由回退(S6)覆盖
+      - S12≈0 且 S6≈0  → 红色更灰 (S<6) 或发暗 (V<18) 或色相偏 (不在0-10/160-180)
+      - S12>0  但没检出红桶 → 别的环节 (合并/判色/中心圆) 有问题
+    每 20 帧一次, 只在有红像素时打印 (隔帧一次 inRange, 开销可忽略)。
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    kernel = np.ones((3, 3), np.uint8)
+    for tag, s in (('S12', 12), ('S6', 6)):
+        m = cv2.inRange(hsv, (0, s, 18), (10, 255, 255))
+        m2 = cv2.inRange(hsv, (160, s, 18), (180, 255, 255))
+        m = cv2.bitwise_or(m, m2)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
+        n = cv2.countNonZero(m)
+        if n > 30:
+            print(f"[RED-PROBE] {tag}: {n}px")
 
 
 def process_recon(frame, frame_count):
-    global bucket_model, recon_tracks
-    if bucket_model is None:
-        # v3.3: 先释放 H 模型显存, 再加载桶模型 (加载更快更稳)
-        maybe_unload_h_model()
-        load_bucket_model()
+    """侦察区只转发最新视频帧；不加载模型、不运行 YOLO/HSV、不写识别坐标。"""
+    push_ws(frame, MissionMode.RECON)
+    push_display(frame)
 
-    # ── v3.2 隔帧调度: 非检测帧复用上次稳定结果 (省 Jetson CPU) ──
-    #    v3.4: 运动/高度门控已删除 → 每帧直接 检测→跟踪→输出,
-    #    重的 YOLO+HSV搜索 每 RECON_INFER_EVERY 帧一次
-    if frame_count % RECON_INFER_EVERY != 0:
-        _emit_recon_result(recon_tracks, frame, frame_count)
-        return
-
-    # ── 阶段 1: YOLO 粗定位 (可选来源) ──
-    with torch.no_grad():
-        results = bucket_model(frame, size=IMG_SIZE)
-    detections = results.xyxy[0].cpu().numpy()
-
-    yolo_boxes = []
-    if len(detections) > 0:
-        for box in detections[detections[:, 5] == 0]:
-            yolo_boxes.append(tuple(box.tolist())[:5])
-
-    # ── 阶段 2: 全帧 HSV 颜色搜索 (正上方主检测, 不依赖桶形状) ──
-    color_boxes = find_color_buckets(frame)
-    if len(yolo_boxes) == 0 and color_boxes and frame_count % 10 == 0:
-        print(f"[RECON] YOLO未检测到桶, HSV颜色搜索找到 {len(color_boxes)} 个候选")
-    if not color_boxes and len(yolo_boxes) == 0:
-        # 低饱和回退: YOLO空 且 正常色块也空 → 放宽 S 下限重扫 (3.5m 标签发灰)
-        color_boxes = find_color_buckets(frame, s_min=RECON_HSV_FALLBACK_S,
-                                         v_min=RECON_HSV_FALLBACK_V_MIN,
-                                         min_area=RECON_HSV_FALLBACK_MIN_AREA)
-        if color_boxes and frame_count % 10 == 0:
-            print(f"[RECON] 低饱和回退找到 {len(color_boxes)} 个候选 "
-                  f"(S>={RECON_HSV_FALLBACK_S})")
-
-    # ── 阶段 3: 合并候选 (重叠保 YOLO 框, HSV 补漏) ──
-    final_boxes = merge_yolo_hsv(yolo_boxes, color_boxes)
-
-    dets = []   # 本帧每个桶的检测结果 (供 track 关联)
-    for idx, (x1, y1, x2, y2, conf) in enumerate(final_boxes):
-        if idx >= MAX_BUCKETS:
-            break
-
-        x1i = max(0, int(x1))
-        y1i = max(0, int(y1))
-        x2i = min(frame.shape[1], int(x2))
-        y2i = min(frame.shape[0], int(y2))
-
-        cx = (x1i + x2i) / 2.0
-        cy = (y1i + y2i) / 2.0
-
-        # 框太小 → 本帧无法判断 (unknown), 保留关联以便跟踪连续性
-        if x2i - x1i < 20 or y2i - y1i < 20:
-            dets.append({'cx': cx, 'cy': cy,
-                         'box': (x1i, y1i, x2i, y2i),
-                         'ellipse': None, 'state': None})
-            continue
-
-        # ── 内缩去框线/背景 ──
-        roi = frame[y1i + RECON_HSV_MARGIN:y2i - RECON_HSV_MARGIN,
-                    x1i + RECON_HSV_MARGIN:x2i - RECON_HSV_MARGIN]
-        if roi.size == 0:
-            dets.append({'cx': cx, 'cy': cy,
-                         'box': (x1i, y1i, x2i, y2i),
-                         'ellipse': None, 'state': None})
-            continue
-
-        # ── 阶段 4: 中心掩码 HSV 占比判色 (v3.5 吸收 v2: 只统计中心圆防桶壁) ──
-        proportions = analyze_color_proportions(roi)
-        if not proportions:
-            # 低饱和回退: 正常判色无果 → 放宽 S 下限重判 (标签发灰时)
-            proportions = analyze_color_proportions(
-                roi, s_min=RECON_HSV_FALLBACK_S, v_min=RECON_HSV_FALLBACK_V_MIN)
-        if proportions and set(proportions.keys()) == {'white'}:
-            # 纯白中心 = 空桶 (无其他饱和色): 不输出 white, 判空
-            proportions = {}
-        if proportions:
-            state = ('color', proportions)   # 完整颜色 dict (多色), 协议不变
-        else:
-            state = ('empty',)   # 未找到标签色 → 确认空桶
-
-        dets.append({'cx': cx, 'cy': cy,
-                     'box': (x1i, y1i, x2i, y2i),
-                     'ellipse': None, 'state': state})
-
-    # ── 阶段 5: 定点突发跟踪 (稳定ID + 滞回确认) ──
-    recon_tracks = update_tracks(recon_tracks, dets)
-
-    # ── 阶段 6: 绘制 + 汇总输出 (与 v3.2 非检测帧共用) ──
-    _emit_recon_result(recon_tracks, frame, frame_count)
 
 
 # ── H 降落 (不变) ──
@@ -1311,23 +1265,27 @@ def process_h(frame, frame_count):
     """
     H 标识降落检测 — 摄像头能看到 H 就实时发送中心坐标。
 
-    逻辑 (v3.3):
+    逻辑 (v3.3 + v3.6):
       1. YOLO 检测 H → 选置信度最高的 → 立即发 cx,cy
       2. 没检测到 → 首帧低阈值扩大搜索 (H_CONF_LOW + 位置邻域) 捞回边缘 H
-      3. 连续 H_LOST_CONFIRM(3) 帧未检出才判真丢失 → 历史补位 (H_HISTORY_MAX 帧)
-      4. 历史过期 → 发 "None" 并清历史
+      3. 连续 H_LOST_CONFIRM(5) 帧未检出才判真丢失 → 真丢失后发 None (v3.6)
+         (1~4 帧防抖窗口内补位历史坐标, 防单帧抖动误停伺服)
+      4. 真丢失且超过 H_HISTORY_MAX(90) 帧 → 清空历史
 
-    三帧滤波意义: 单帧抖动/偶发误检不算丢失 → 不误发 None → 控制端不误返航。
+    v3.6 修复: 旧代码丢失后 90 帧持续补位旧坐标, C++ 端无法区分真/补位,
+    拿旧坐标继续视觉伺服; 现在真丢失即发 None, C++ 端进 lost-tracking 分支。
     模型切换: 先卸载桶模型释放显存, 再加载 H (加载更快, 避免"飞过H才就绪")。
     """
-    global h_model, h_last_cx, h_last_cy, h_last_conf, h_loss_frames
+    global h_model, h_last_cx, h_last_cy, h_last_conf, h_last_box, h_loss_frames
     if h_model is None:
         if h_model_loading:
             # v3.3: 后台预加载进行中 → 不阻塞推理线程。
-            #   发历史坐标 (有历史) 或 None (无历史), 等后台加载完成后续帧再检测
+            #   v3.6: 加载期同样走丢失滤波 — 有历史且未超防抖窗才补位,
+            #         否则发 None (旧代码加载期无限补位旧坐标, 绕过丢失滤波)
+            h_loss_frames += 1
             h_img, w_img = frame.shape[:2]
             result_frame = frame.copy()
-            if h_last_cx is not None:
+            if h_last_cx is not None and h_loss_frames < H_LOST_CONFIRM:
                 msg = f"{h_last_cx:.2f},{h_last_cy:.2f}"
                 cv2.circle(result_frame, (int(h_last_cx), int(h_last_cy)),
                            15, (0, 165, 255), 2)
@@ -1345,6 +1303,8 @@ def process_h(frame, frame_count):
             h_pipe_queue.put(msg)
             push_save(result_frame, "H")
             push_display(result_frame)
+            if frame_count % H_WS_EVERY == 0:
+                push_ws(result_frame)
             return
         # 兜底: 无后台加载 → 同步加载 (先释放桶显存)
         maybe_unload_bucket_model()
@@ -1366,6 +1326,7 @@ def process_h(frame, frame_count):
         x1, y1, x2, y2, conf, cls = top
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         best_box = (x1, y1, x2, y2, conf, cx, cy)
+        h_last_box = (x2 - x1, y2 - y1)   # v3.9: 记录框大小 (重检自适应半径)
 
         h_last_cx, h_last_cy = cx, cy
         h_last_conf = conf
@@ -1375,9 +1336,12 @@ def process_h(frame, frame_count):
     # ── 2. 没检测到 → v3.3 三帧滤波 + 扩大搜索 ──
     else:
         h_loss_frames += 1
-        # 扩大搜索: 真丢失前, 用更低阈值重检一次 (捞回边缘/小/畸变 H)
-        #   首帧未检出不算丢失, 仅作重检; 避免频繁重检耗算力
-        if h_loss_frames == 1 and h_last_cx is not None:
+        # 扩大搜索: 真丢失前, 丢失窗口内每帧用更低阈值重检 (捞回边缘/小/畸变 H)
+        #   v3.9: 旧逻辑只在丢失第1帧重检一次 (单次侥幸), 第2~4帧纯补位旧坐标,
+        #   第5帧判死 → 降落时 H 因运动模糊/俯仰瞬间出画就丢。
+        #   现在 1..H_LOST_CONFIRM 帧每一帧都重检, 只要 H 在某帧可见立刻捞回;
+        #   真丢失确认 (≥H_LOST_CONFIRM) 后不再重检直接发 None, 成本可控。
+        if h_loss_frames <= H_LOST_CONFIRM and h_last_cx is not None:
             _h_model_backup_conf = h_model.conf
             h_model.conf = H_CONF_LOW
             try:
@@ -1391,26 +1355,41 @@ def process_h(frame, frame_count):
                 top2 = h2[h2[:, 4].argmax()]
                 x1, y1, x2, y2, conf2, cls2 = top2
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                # 扩大搜索: 位置在上次检测附近才接受, 防远距离误检
-                if (abs(cx - h_last_cx) <= H_SEARCH_RADIUS and
-                        abs(cy - h_last_cy) <= H_SEARCH_RADIUS):
+                # 扩大搜索: 位置在上次检测附近才接受, 防远距离误检。
+                #   v3.9: 半径随上次 H 框大小自适应 — H 越大越近、中心移动越快,
+                #   固定 200px 可能滑出邻域被拒; 小 H (远) 仍用 H_SEARCH_RADIUS。
+                radius = H_SEARCH_RADIUS
+                if h_last_box is not None:
+                    radius = max(radius, h_last_box[0], h_last_box[1])
+                if (abs(cx - h_last_cx) <= radius and
+                        abs(cy - h_last_cy) <= radius):
                     best_box = (x1, y1, x2, y2, conf2, cx, cy)
+                    h_last_box = (x2 - x1, y2 - y1)   # v3.9: 重检捞回也刷新框大小
                     h_last_cx, h_last_cy = cx, cy
                     h_last_conf = conf2
                     h_loss_frames = 0
                     msg = f"{cx:.2f},{cy:.2f}"
 
-        # 三帧滤波: 连续 H_LOST_CONFIRM 帧未检出才判真丢失, 进入历史补位
+        # 三帧滤波: 连续 H_LOST_CONFIRM 帧未检出才判真丢失
         #   (单帧抖动/偶发误检: 不发 None, 继续补上次坐标, 控制端不会误返航)
+        #   v3.6 修复: 真丢失 (≥H_LOST_CONFIRM) 后管道必须发 None 停伺服 —
+        #   旧代码两分支都补位历史坐标, 导致"没有标识却一直发旧坐标"最长 90 帧(~3s),
+        #   C++ 端无法区分真检测/补位, 拿旧坐标继续视觉伺服。
+        #   修复后 C++ 端走 lost-tracking 分支 (用上次世界误差 + 继续下降), 无需改 C++。
         if msg == "None" and h_last_cx is not None:
             if h_loss_frames < H_LOST_CONFIRM:
                 msg = f"{h_last_cx:.2f},{h_last_cy:.2f}"
-            elif h_loss_frames <= H_HISTORY_MAX:
-                msg = f"{h_last_cx:.2f},{h_last_cy:.2f}"
             else:
-                h_last_cx = h_last_cy = None
-                h_last_conf = 0.0
-                h_loss_frames = 0
+                msg = "None"
+                if h_loss_frames > H_HISTORY_MAX:
+                    h_last_cx = h_last_cy = None
+                    h_last_conf = 0.0
+                    h_last_box = None   # v3.9: 历史清空时一并清空框大小
+                    h_loss_frames = 0
+        else:
+            # 无历史 (已清空/从未检出) → 计数无意义, 复位,
+            #   防 HUD 显示 "H:HOLD N/90" 无限增长 (应走 LOST)
+            h_loss_frames = 0
 
     # ── 3. 绘制 ──
     if best_box is not None:
@@ -1458,7 +1437,8 @@ def process_h(frame, frame_count):
         tag = f" conf={best_box[4]:.2f}"
     elif msg != "None" and h_loss_frames > 0:
         tag = " (hist)"
-    print(f"[H] {msg}{tag}")
+    if frame_count % H_LOG_EVERY == 0 or msg == "None":
+        print(f"[H] {msg}{tag}")
 
     while not h_pipe_queue.empty():
         try: h_pipe_queue.get_nowait()
@@ -1467,6 +1447,8 @@ def process_h(frame, frame_count):
 
     push_save(result_frame, "H")
     push_display(result_frame)
+    if frame_count % H_WS_EVERY == 0:
+        push_ws(result_frame, MissionMode.H_LAND)
 
 
 def push_display(frame):
@@ -1486,12 +1468,75 @@ def push_save(frame, mode_name):
             save_queue.get_nowait()
         except queue.Empty:
             pass
-    save_queue.put((frame.copy(), mode_name))
+    save_queue.put((frame, mode_name))
+
+
+def push_ws(frame, mode=None):
+    """v4: 覆盖式推送到 WebSocket 队列，带模式信息用于选择压缩质量"""
+    while not ws_queue.empty():
+        try:
+            ws_queue.get_nowait()
+        except queue.Empty:
+            break
+    ws_queue.put((frame, mode))
 
 
 # ═══════════════════════════════════════════════════════════════
-#  管道发送、显示、保存线程 (不变)
+#  管道发送、显示、保存、WebSocket 线程
 # ═══════════════════════════════════════════════════════════════
+
+def ws_server_thread():
+    """v3.8: WebSocket 服务线程 (独立事件循环运行异步服务器)"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(ws_main())
+    except Exception as e:
+        print(f"[WS] WebSocket 服务异常: {e}")
+    finally:
+        loop.close()
+
+
+async def ws_handler(websocket, path=None):
+    """v4: 每个客户端连接后，持续从 ws_queue 取帧并发送，根据模式选择 JPEG 质量
+    (Python 3.8 兼容: 用 get_nowait + run_in_executor 替代 asyncio.to_thread)
+    """
+    print(f"[WS] 客户端已连接: {websocket.remote_address}")
+    loop = asyncio.get_event_loop()
+    try:
+        while running:
+            try:
+                # 非阻塞取帧 (Python 3.8 兼容, 不用 asyncio.to_thread)
+                data = ws_queue.get_nowait()
+                # v4: 兼容旧格式 (frame) 和新格式 (frame, mode)
+                if isinstance(data, tuple):
+                    frame, mode = data
+                else:
+                    frame, mode = data, None
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+
+            # v4: 根据模式选择 JPEG 质量（侦察区高质量，其他区标准质量）
+            quality = RECON_WS_JPEG_QUALITY if mode == MissionMode.RECON else WS_JPEG_QUALITY
+
+            # JPEG 编码放到线程池执行, 避免卡住事件循环 (Python 3.8 兼容)
+            _, jpeg = await loop.run_in_executor(
+                None, cv2.imencode, '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+            await websocket.send(jpeg.tobytes())
+    except websockets.exceptions.ConnectionClosed:
+        print(f"[WS] 客户端已断开: {websocket.remote_address}")
+    except Exception as e:
+        print(f"[WS] 连接异常: {e}")
+
+
+async def ws_main():
+    """v3.8: WebSocket 服务主循环"""
+    async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
+        print(f"[WS] WebSocket 服务器已启动 ws://{WS_HOST}:{WS_PORT}")
+        await asyncio.Future()  # 永久运行
+
 
 def pipe_sender_worker():
     global running, vision_pipe_fd, recon_pipe_fd, h_pipe_fd
@@ -1662,6 +1707,7 @@ def main():
     t_cap = threading.Thread(target=capture_worker, daemon=True); t_cap.start(); threads.append(t_cap)
     t_inf = threading.Thread(target=inference_worker, daemon=True); t_inf.start(); threads.append(t_inf)
     t_pipe = threading.Thread(target=pipe_sender_worker, daemon=True); t_pipe.start(); threads.append(t_pipe)
+    t_ws = threading.Thread(target=ws_server_thread, daemon=True); t_ws.start(); threads.append(t_ws)  # v3.8: WebSocket 服务
     if USE_DISPLAY:
         t_disp = threading.Thread(target=display_worker, daemon=True); t_disp.start(); threads.append(t_disp)
 

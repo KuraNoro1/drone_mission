@@ -44,8 +44,9 @@ void handleDropSearch() {
 
 ```
 SCAN → SELECT → GOTO → CENTER → DESCEND → DROP → CLIMB
- (8s)  (pick  (pos模式    (vel模式   (下降)     ↓      ↓
-        target) 2.5m)      2.5m)           (失败: 下一目标) (完成: 下一目标)
+  ↓       ↓    (pos模式    (vel模式   (下降)     ↓      ↓
+(8s)   (pick   3.5m)      3.5m)           (失败: 下一目标) (完成 → SELECT)
+        target)
 ```
 
 ### SCAN (8s, 3.5m)
@@ -58,35 +59,36 @@ SCAN → SELECT → GOTO → CENTER → DESCEND → DROP → CLIMB
 ```
 选最高分未使用的目标
 ├─ 有未使用 → GOTO
-└─ 全部用完 → 重新扫描(8s, +0.5m高度)
-              ├─ 有结果 → SELECT
-              └─ 无结果 → timeout
+└─ 全部用完:
+    └─ 重扫(限1次): 飞回原点 → 右移1.5m → 10s扫描(新视角+多采样)
+          ├─ 有结果 → SELECT
+          └─ 无结果 → timeout
 ```
 
-### GOTO (position 模式, 3.0m)
+### GOTO (position 模式, 3.5m)
 ```
-startPositionModeAt 内部自动处理 velocity→position 切换 (无外部 stop/sleep)
-while dist > 0.3m || |alt-3.0| > 0.2m: setPositionNed()
+startPositionModeAt 内部自动处理 velocity→position 切换
+while dist > 0.3m || |alt-3.5| > 0.2m: setPositionNed()
 timeout 15s
 ```
 
-### CENTER (velocity 模式, 3.0m)
+### CENTER (velocity 模式, 3.5m)
 ```
 startVelocityMode 内部处理 position→velocity 切换, 无外部 stop/sleep
 初始稳定阶段用高度 P 控制而非 vz=0, 防止模式切换时跌落
 目标匹配: 取画面中心最近检测 (距中心 <600px), 无世界坐标投影
 像素伺服: PID(kp=0.98, ki=0.15) → bodyFrame velocity → NED velocity
-收敛条件: 滑动窗口 20帧中≥4帧 pixelErr<40px (1.0s, 容忍80%丢帧)
+(视觉丢失时原地悬停, 不启用世界坐标兜底)
+收敛条件: 滑动窗口 20帧中≥4帧 pixelErr<40px (1.0s)
 失败: 丢失 >5s 或超时 30s → 返回 SELECT
-```
 
-### DESCEND (velocity 模式, 3.0m → 1.8m)
+### DESCEND (velocity 模式, 3.5m → 1.8m)
 ```
 继承 CENTER PID 积分 (不 reset)
 下降前对齐: 滑动窗口 16帧中≥3帧 pixelErr<40px (0.8s, 容忍81%丢帧)
 下降速率: 0.3 m/s, 视觉丢失 2s 内保持下降 (避免间歇检测卡住)
 丢检测>2s: 悬停等待; 丢检测>5s: 放弃本目标
-到达 1.8m: 滑动窗口 10帧中≥3帧满足 pix+vel+alt (0.5s, 容忍70%丢帧)
+到达 1.8m: 滑动窗口逐帧推进, 10帧中≥3帧满足 pix+vel+alt (0.5s)
 ```
 
 ### DROP
@@ -102,7 +104,7 @@ PWM: releasePwm=1900 (800ms), 然后 holdPwm=1100
 ```
 爬升回搜索高度 3.5m
 dropCount ≥ 2 → DONE
-否则 → SELECT (下一目标)
+dropCount < 2 → SELECT (继续下一目标)
 ```
 
 ---

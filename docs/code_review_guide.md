@@ -100,7 +100,7 @@ LOST_CRITICAL/REACQUIRE: 40+ 帧 (依 committed 区分)
 
 // 目标匹配: 取画面中心最近的检测 (距中心 <600px)
 // 不再用 worldToPixel 投影世界坐标, 消除 SCAN 坐标偏差导致的检测丢弃
-// 无像素 >0.5s: 世界坐标兜底 (导航到 SCAN 地图坐标)
+// 无像素: 原地悬停 (已移除世界坐标兜底, 避免飞偏)
 // 视觉丢失 >5s (DESCEND) / >5s (CENTER): 放弃本目标
 
 // PID 保护: hasPix 为 false 时不调用 pidX_->update(), 防止垃圾数据污染积分

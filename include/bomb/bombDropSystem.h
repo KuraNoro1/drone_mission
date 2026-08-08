@@ -100,6 +100,7 @@ private:
     struct MapEntry { WorldTarget world; int bucketId; double score; bool used; };
     std::vector<MapEntry> targetMap_;
     int currentTargetIdx_;
+    int rescanCount_ = 0;                 // 重扫次数限制
 
     // 目标跟踪器
     std::unique_ptr<TargetTracker> tracker_;
