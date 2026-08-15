@@ -277,14 +277,18 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
     const int STABLE_FRAMES = 3;
     const int MIN_WORLD_SAMPLES = 3;
 
+    auto hold = link_.nedPosition();
+    double holdN = hold.northM;
+    double holdE = hold.eastM;
+
     if (!offboard_.isActive()) {
-        auto ned = link_.nedPosition();
         offboard_.startPositionModeAt(
-            static_cast<float>(ned.northM), static_cast<float>(ned.eastM),
+            static_cast<float>(holdN), static_cast<float>(holdE),
             static_cast<float>(-cfg_.searchAlt), initYaw_);
     }
 
-    log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m...");
+    log("Scanning for buckets at " + std::to_string(cfg_.searchAlt) + "m, hold=(" +
+        std::to_string(holdN).substr(0,5) + "," + std::to_string(holdE).substr(0,5) + ")");
 
     int emptyFrames = 0;
     const int EMPTY_TIMEOUT_FRAMES = 30;  // 3s连续无检测才清空聚类
@@ -292,7 +296,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
     while (duration<double>(steady_clock::now() - t0).count() < timeoutSec) {
         auto ned = link_.nedPosition();
         offboard_.setPositionNed(
-            static_cast<float>(ned.northM), static_cast<float>(ned.eastM),
+            static_cast<float>(holdN), static_cast<float>(holdE),
             static_cast<float>(-cfg_.searchAlt), initYaw_);
 
         multiBucketData vis;

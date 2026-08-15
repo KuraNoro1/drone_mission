@@ -4,11 +4,10 @@ dropZone:
   priority: 0               # 0=优先大桶(25cm), 1=优先小桶(15cm)
 
 reconZone:
-  forwardDistance: 55.0     # 机头前方距离 (m)
+  forwardDistance: 57.5     # 机头前方距离 (m) — 侦察区中心 (近边55m + 半长2.5m)
   hoverTime: 3.0            # 每航点悬停时间 (s)
-  waypoints:                # 相对于侦察区中心的 NED 偏移
-    - { north:  0.0, east:  0.0 }
-    - { north: -2.0, east:  1.5 }
-    - { north:  2.0, east:  1.5 }
-    - { north:  2.0, east: -1.5 }
-    - { north: -2.0, east: -1.5 }
+  waypoints:                # 相对于侦察区中心的 NED 偏移 (2行×2列, 覆盖5m北×8m东)
+    - { north: -1.25, east: -1.7 }
+    - { north: -1.25, east:  1.7 }
+    - { north:  1.25, east:  1.7 }
+    - { north:  1.25, east: -1.7 }

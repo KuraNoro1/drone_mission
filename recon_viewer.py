@@ -18,13 +18,27 @@
 ======================================================
 """
 
+import os
+
+# ── 消除 cv2 Qt 后端字体警告 (QFontDatabase: Cannot find font directory ...) ──
+# opencv-python 的 Qt 显示后端找不到其捆绑字体目录 (cv2/qt/fonts) 时,
+# 每次创建窗口都会打印 "QFontDatabase: Cannot find font directory ..."。
+# 在导入 cv2 之前把 Qt 字体目录指到系统字体目录即可消除该打印, 不影响显示。
+_FONT_DIR = None
+for _d in ("/usr/share/fonts", "/usr/local/share/fonts", "C:/Windows/Fonts"):
+    if os.path.isdir(_d):
+        _FONT_DIR = _d
+        break
+if _FONT_DIR:
+    os.environ.setdefault("QT_QPA_FONTDIR", _FONT_DIR)
+
 import asyncio
 import websockets
 import cv2
 import numpy as np
 
 # ── 配置 ──
-JETSON_IP = "192.168.144.106"  # Jetson Nano 的固定 IP（图传网络）
+JETSON_IP = "192.168.144.108"  # Jetson Nano 的固定 IP（图传网络）
 WS_PORT = 8765
 RECONNECT_INTERVAL = 2  # 断线后每隔几秒自动重连
 
