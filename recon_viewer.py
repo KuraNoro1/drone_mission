@@ -38,7 +38,7 @@ import cv2
 import numpy as np
 
 # ── 配置 ──
-JETSON_IP = "192.168.144.108"  # Jetson Nano 的固定 IP（图传网络）
+JETSON_IP = "192.168.144.106"  # Jetson Nano 的固定 IP（图传网络）
 WS_PORT = 8765
 RECONNECT_INTERVAL = 2  # 断线后每隔几秒自动重连
 

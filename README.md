@@ -237,29 +237,32 @@ gst-launch-1.0 nvarguscamerasrc ! \
 
 ## 相机参数
 
-### 真机 IMX219 (1280×720 binned, pixel=2.24µm)
+> **唯一权威来源: `scripts/detector_unified.py`**
+> 运行时内参优先取 USB 标定 NPZ (`USB_CALIB_NPZ`) 的 `new_camera_matrix`；
+> 无标定则回退 `fx=fy=1357, cx=640, cy=360` (1280×720)。
 
-| 参数 | 值 |
-|------|-----|
-| 焦距 f | 3.04mm |
-| fx/fy | 1357.0 |
-| cx | 640.0 |
-| cy | 360.0 |
-| 安装偏移 (base_link) | (0.15, 0, -0.08) m |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| fx/fy | 1357.0 (回退值) | 以 detector_unified 运行时有效值为准 |
+| cx | 640.0 | |
+| cy | 360.0 | |
+| 安装偏移 (base_link) | (0, 0, 0) m | detector_unified `CAM_DX=CAM_DY=0` (云台中心=相机中心) |
 
-修改后需同步:
-- `scripts/detector_unified.py` 中的 `FX, FY, CX, CY`
-- `scripts/detector_real.py` 中的 `FX, FY, CX, CY`
-- `src/bomb/coordinateMapper.cpp` 中的 `fx, cx, cy`
-- `src/mission/missionStateMachine.cpp` 中的 `computeMountPixels()`
+坐标约定 (全局统一): **图像右 = 机体右, 图像下 = 机体后**。
+
+修改相机内参/偏移后需手工同步 (静态对齐):
+- `scripts/detector_unified.py` (权威)
+- `scripts/detector_real.py` 中的 `FX, FY, CX, CY, CAM_DX, CAM_DY`
+- `config/camera.yaml` 中的 `fx, fy, cx, cy, offsetForward, offsetRight, offsetDown`
+- `src/bomb/coordinateMapper.cpp` 使用 `config/camera.yaml`，无需改常数
 
 ---
 
-## 物理参数 (挂载点与相机偏移)
+## 物理参数 (挂载点)
 
 | 参数 | 值 (m) | 来源 |
 |------|--------|------|
-| 相机 X 偏移 | 0.15 | 安装位置 |
+| 相机 X 偏移 | 0.0 | 与 detector_unified 一致 |
 | 左挂载点 | (-0.07, 0.001) | 舵机安装 |
 | 右挂载点 | (0.07, -0.001) | 舵机安装 |
 | 桶物理半径 | 0.10 | 标准桶 |
@@ -291,7 +294,7 @@ gst-launch-1.0 nvarguscamerasrc ! \
 | 投放策略 | `src/bomb/bombDropSystem.cpp` |
 | 目标容错参数 | `src/bomb/targetTracker.cpp` |
 | 管道协议 | `src/vision/visionInterface.cpp` |
-| 相机参数 | `src/bomb/coordinateMapper.cpp` + `scripts/detector_unified.py` |
+| 相机参数 | `scripts/detector_unified.py` (权威) + `config/camera.yaml` |
 | FC 连接 | `config/connection.yaml` |
 
 ---

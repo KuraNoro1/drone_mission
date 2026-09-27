@@ -39,7 +39,7 @@ FX = 1357.0
 FY = 1357.0
 CX = 640.0
 CY = 360.0
-CAM_DX, CAM_DY = 0.15, 0.0
+CAM_DX, CAM_DY = 0.0, 0.0   # 与 detector_unified.py 一致: 云台中心=相机中心
 MNT_LX, MNT_LY = -0.07, 0.001
 MNT_RX, MNT_RY = 0.07, -0.001
 WORLD_R = 0.10

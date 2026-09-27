@@ -179,9 +179,14 @@ count=0 时只有 1 字节
 
 相机: OpenCV标准 (X右, Y下, Z前)
   - 安装: 朝下 (nadir)
-  - 内参: fx=fy=554.26, cx=cy=320 (仿真) / fx=fy=1357.0, cx=640, cy=360 (真机 IMX219)
+  - 内参: 以 scripts/detector_unified.py 为准 (USB 标定 NPZ 的 new_camera_matrix, 回退 fx=fy=1357, cx=640, cy=360)
+  - 安装偏移: config/camera.yaml (与 detector_unified 的 CAM_DX/CAM_DY 一致, 当前为 0)
 
 机体: 前(North), 右(East), 下(Down)
+
+方向约定 (全局统一):
+  - 图像右 = 机体右
+  - 图像下 = 机体后
 
 像素→世界映射流程:
   像素(u,v) → 归一化(xn,yn) → 相机系射线 → 机体系(旋转) → NED系(含roll/pitch/yaw) → 地平面求交

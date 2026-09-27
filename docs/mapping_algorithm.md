@@ -54,8 +54,8 @@ Step 1: 像素归一化
     r_cam = [xn, yn, 1]^T    (相机坐标系射线)
 
 Step 2: 相机系 → 机体系
-    R_c2b = [[0,1,0], [1,0,0], [0,0,1]]
-    (Xc=右 → Yb=右, Yc=下 → Xb=前, Zc=前 → Zb=下)
+    R_c2b = [[0,-1,0], [1,0,0], [0,0,1]]
+    (Xc=右 → Yb=右, Yc=下 → Xb=后, Zc=前 → Zb=下)
     r_body = R_c2b × r_cam
 
 Step 3: 机体系 → NED世界系
@@ -71,7 +71,7 @@ Step 5: 地平面求交
     目标世界 = cam_ned + t × r_ned
 ```
 
-**当前简化**: `pixelToWorld()` 传入 `roll=0, pitch=0`，仅使用 yaw。在无人机基本水平时近似有效。
+**当前实现**: `BombDropSystem::scanForTargets()` 已从 `droneLink` 读取 roll/pitch/yaw 传入 `pixelToWorld()`（`src/bomb/bombDropSystem.cpp`）。
 
 ## 二、调试方法
 
