@@ -35,10 +35,11 @@ Matrix33 eulerToRotation(double roll, double pitch, double yaw) {
 // ── 相机系 → 机体系 (相机朝下安装) ────────────────────────
 // 相机系: Xc=右, Yc=下, Zc=前(指向地面)
 // 机体系: Xb=前(North), Yb=右(East), Zb=下(Down)
-// 映射:  Xb = Yc(图像行→前进方向),  Yb = Xc(图像列→右),  Zb = Zc(相机前方=朝下)
+// 安装约定: 图像右=机体右, 图像下=机体后
+// 映射:  Xb = -Yc(图像下→机体后), Yb = Xc(图像列→机体右), Zb = Zc(相机前方=朝下)
 Matrix33 cameraToBodyRotation() {
     return Matrix33(
-         0,  1,  0,
+         0, -1,  0,
          1,  0,  0,
          0,  0,  1
     );
@@ -162,7 +163,7 @@ bool worldToPixel(double worldN, double worldE,
     double bod_z = (cy*sp*cr + sy*sr)*dN + (sy*sp*cr - cy*sr)*dE + cp*cr*dD;
 
     double cam_x = bod_y;
-    double cam_y = bod_x;
+    double cam_y = -bod_x;
     double cam_z = bod_z;
 
     if (cam_z <= 0) return false;

@@ -7,6 +7,7 @@
 #include <sstream>
 #include <algorithm>
 #include <unistd.h>
+#include "control/pixelServo.h"
 
 using namespace std::this_thread;
 using namespace std::chrono;
@@ -1248,26 +1249,36 @@ void missionStateMachine::handleRtl() {
     offboard_->stop();
     sleep_for(milliseconds(200));
 
-    const double imgCenterX = config_.camera.cx, imgCenterY = config_.camera.cy;
-    const double fx = config_.camera.fx, fy = config_.camera.fy;
-    const double kpTrack = 0.6;
-    const double maxVelH = 0.5;
     const double landTriggerAlt = 0.4;
     const double descendRate = 0.3;
     const double slowDescendRate = 0.15;
     const double maxAlt = 5.0;
     const double altRecoveryRate = 0.5;
     const double H_NEVER_FOUND_TIMEOUT = 30.0;
+    const double ALIGN_TOL_PX = 40.0;
+    const int    ALIGN_WIN = 16;      // 0.8s @ 50ms
+    const int    ALIGN_MIN = 3;
+    const double LOST_TIMEOUT = 5.0;
 
     log("[RTL-H] Starting H-guided descent phase");
-    offboard_->startVelocityMode();
+    bool velocityOk = offboard_->startVelocityMode();
+    if (!velocityOk) {
+        log("[RTL-H] ERROR: Cannot start velocity mode, falling back to MAVSDK land");
+    }
+
+    // 共享像素伺服: 与投放区 CENTER/DESCEND 同一实现 (PID + 置信度 + 航向校准)
+    pixelServo servo;
+    servo.configure(config_.visualServo.kp, 0.15, 0.0,
+                    config_.visualServo.maxVelXY,
+                    config_.camera.cx, config_.camera.cy);
 
     auto hSearchStart = steady_clock::now();
     bool hEverFound = hSeenDuringCruise;
-    double lastWorldErrN = 0, lastWorldErrE = 0;
-    double lostTrackingTime = 0;
+    bool alignVerified = false;
+    int  alignHist[ALIGN_WIN] = {0};
+    int  alignIdx = 0, alignCnt = 0, alignFrameCnt = 0;
 
-    while (running_ && link_.isConnected()) {
+    while (velocityOk && running_ && link_.isConnected()) {
         if (!link_.inAir()) break;
 
         if (!hEverFound &&
@@ -1279,59 +1290,62 @@ void missionStateMachine::handleRtl() {
         float currentAlt = link_.altitude();
         if (currentAlt < 0.15f) break;
 
-        float vz;
-        if (currentAlt > maxAlt) {
-            vz = static_cast<float>(altRecoveryRate);
-        } else if (currentAlt > landTriggerAlt) {
-            vz = static_cast<float>(descendRate);
-        } else {
-            vz = static_cast<float>(slowDescendRate);
+        double hCx = 0.0, hCy = 0.0;
+        bool hasPix = (hPipe_ && hPipe_->readLatest(hCx, hCy));
+        if (hasPix) hEverFound = true;
+
+        double yawDeg = bombSystem_ ? bombSystem_->correctedYawDeg()
+                                    : static_cast<double>(link_.headingDeg());
+        double vx = 0.0, vy = 0.0, pixelErr = 1e9, confidence = 0.0;
+        servo.step(hasPix, hCx, hCy, currentAlt, yawDeg,
+                   0.05, 1.0, vx, vy, pixelErr, confidence);
+        double sincePix = servo.sinceLastSeen();
+
+        // ── 下降前对准确认: 需在对准窗口内稳定命中 ──
+        if (!alignVerified) {
+            bool alignOk = hasPix && pixelErr < ALIGN_TOL_PX;
+            alignFrameCnt++;
+            alignCnt -= alignHist[alignIdx];
+            alignHist[alignIdx] = alignOk ? 1 : 0;
+            alignCnt += alignHist[alignIdx];
+            alignIdx = (alignIdx + 1) % ALIGN_WIN;
+            if (alignFrameCnt >= ALIGN_WIN && alignCnt >= ALIGN_MIN) {
+                alignVerified = true;
+                log("[RTL-H] Aligned (pixErr=" + std::to_string((int)pixelErr) +
+                    "px), starting descent");
+            }
         }
 
-        double vx = 0.0, vy = 0.0;
-        double hCx, hCy;
-        if (hPipe_ && hPipe_->readLatest(hCx, hCy)) {
-            hEverFound = true;
-            lostTrackingTime = 0;
-            double errX = hCx - imgCenterX;
-            double errY = hCy - imgCenterY;
-            double altClamped = std::max(static_cast<double>(currentAlt), 0.3);
-            double bodyErrFwd = errY * altClamped / fy;
-            double bodyErrRgt = errX * altClamped / fx;
-            double yawRad = static_cast<double>(link_.headingDeg()) * M_PI / 180.0;
-            lastWorldErrN = std::cos(yawRad) * bodyErrFwd - std::sin(yawRad) * bodyErrRgt;
-            lastWorldErrE = std::sin(yawRad) * bodyErrFwd + std::cos(yawRad) * bodyErrRgt;
-            vx = kpTrack * lastWorldErrN;
-            vy = kpTrack * lastWorldErrE;
-            vx = std::max(-maxVelH, std::min(maxVelH, vx));
-            vy = std::max(-maxVelH, std::min(maxVelH, vy));
-
-            static int hLogCnt = 0;
-            if (++hLogCnt % 5 == 1) {
-                char buf[160];
-                std::snprintf(buf, sizeof(buf),
-                    "[RTL-H] pixel(%.0f,%.0f) err(%.1f,%.1f) world(%.2f,%.2f) vel(%.2f,%.2f) alt=%.1f",
-                    hCx, hCy, errX, errY, lastWorldErrN, lastWorldErrE, vx, vy, currentAlt);
-                log(buf);
-            }
-        } else if (hEverFound) {
-            lostTrackingTime += 0.1;
-            vx = kpTrack * lastWorldErrN;
-            vy = kpTrack * lastWorldErrE;
-            vx = std::max(-maxVelH, std::min(maxVelH, vx));
-            vy = std::max(-maxVelH, std::min(maxVelH, vy));
-            if (static_cast<int>(lostTrackingTime * 10) % 20 == 1) {
-                char buf[140];
-                std::snprintf(buf, sizeof(buf),
-                    "[RTL-H] H lost %.1fs, tracking last: world(%.3f,%.3f) alt=%.1f",
-                    lostTrackingTime, lastWorldErrN, lastWorldErrE, currentAlt);
-                log(buf);
-            }
+        // ── 垂直: 对准后才下降; 视觉丢失 2s 内保持下降, 否则原地悬停等待 ──
+        double vz = 0.0;
+        if (alignVerified && (hasPix || sincePix < 2.0)) {
+            if (currentAlt > maxAlt)              vz = altRecoveryRate;
+            else if (currentAlt > landTriggerAlt) vz = descendRate;
+            else                                  vz = slowDescendRate;
         }
 
         offboard_->setVelocityNed(
-            static_cast<float>(vx), static_cast<float>(vy), vz, initYaw_);
-        sleep_for(milliseconds(100));
+            static_cast<float>(vx), static_cast<float>(vy),
+            static_cast<float>(vz), initYaw_);
+
+        static int hLogCnt = 0;
+        if (++hLogCnt % 5 == 1) {
+            char buf[180];
+            std::snprintf(buf, sizeof(buf),
+                "[RTL-H] %s pixelErr=%.0f v=(%.2f,%.2f,%.2f) alt=%.1f lost=%.1fs conf=%.2f %s",
+                hasPix ? "LIVE" : "LOST", pixelErr, vx, vy, vz, currentAlt,
+                sincePix, confidence, alignVerified ? "(descend)" : "(align)");
+            log(buf);
+        }
+
+        // ── 丢失中止: 已检到过 H 且持续丢失超过阈值 → 放弃, 回退 MAVSDK land ──
+        if (hEverFound && sincePix > LOST_TIMEOUT) {
+            log("[RTL-H] H lost >" + std::to_string(LOST_TIMEOUT) +
+                "s, aborting to MAVSDK land");
+            break;
+        }
+
+        sleep_for(milliseconds(50));
     }
 
     offboard_->stop();

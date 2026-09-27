@@ -65,7 +65,16 @@ WS_PORT = 8765
 RECON_WS_JPEG_QUALITY = 70  # 侦察区高质量 (平衡帧率与画质)
 WS_JPEG_QUALITY = 60         # 投放/降落标准质量
 
-STREAM_URL = "tcp://127.0.0.1:5000"
+STREAM_URL = "tcp://127.0.0.1:5000"  # 仅 --sim 使用
+# 真机 USB: 必须整数索引 + V4L2 + MJPG, 禁止传 "/dev/video0" 字符串
+USB_CAM_INDEX = 0
+USB_CAM_WIDTH = 1280
+USB_CAM_HEIGHT = 720
+USB_CAM_FPS = 30
+USB_CALIB_NPZ = "/home/hy/test_mavsdk_1/usb_camera_calib_1280x720.npz"
+_undistort_maps = None  # (map1, map2), 采集线程启动时预计算, 禁止每帧 init
+_usb_cap = None         # 真机: 主线程打开后交给抓帧线程, 禁止后台首次 open
+
 IMG_SIZE = 416
 CONF_THRESH = 0.6
 IOU_THRESH = 0.45
@@ -76,17 +85,21 @@ SIM_MODE = False
 GST_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gz_gst_bridge.py")
 
-# ── 相机内参 (真机 IMX219) ──
-CALIB_NPZ_PATH = os.path.expanduser(f"~{os.environ.get('SUDO_USER', 'hy')}/rgb_camera_calib_1.npz")
+# ── 相机内参 (真机 USB 去畸变后用 new_camera_matrix; 无 USB 标定则回退 CSI) ──
+_CSI_CALIB_NPZ = os.path.expanduser(f"~{os.environ.get('SUDO_USER', 'hy')}/rgb_camera_calib_1.npz")
+CALIB_NPZ_PATH = USB_CALIB_NPZ if os.path.exists(USB_CALIB_NPZ) else _CSI_CALIB_NPZ
 if os.path.exists(CALIB_NPZ_PATH):
     try:
         _calib_data = np.load(CALIB_NPZ_PATH)
-        _K = _calib_data['camera_matrix']
+        if 'new_camera_matrix' in _calib_data.files:
+            _K = _calib_data['new_camera_matrix']
+        else:
+            _K = _calib_data['camera_matrix']
         CAM_FX_REAL = float(_K[0, 0])
         CAM_FY_REAL = float(_K[1, 1])
         CAM_CX_REAL = float(_K[0, 2])
         CAM_CY_REAL = float(_K[1, 2])
-        print(f"✅ 已加载相机标定: FX={CAM_FX_REAL:.1f}, FY={CAM_FY_REAL:.1f}, CX={CAM_CX_REAL:.1f}, CY={CAM_CY_REAL:.1f}")
+        print(f"✅ 已加载相机标定 ({os.path.basename(CALIB_NPZ_PATH)}): FX={CAM_FX_REAL:.1f}, FY={CAM_FY_REAL:.1f}, CX={CAM_CX_REAL:.1f}, CY={CAM_CY_REAL:.1f}")
     except Exception as e:
         print(f"⚠️ 标定文件加载失败: {e}，使用默认值")
         CAM_FX_REAL, CAM_FY_REAL = 1357.0, 1357.0
@@ -646,32 +659,175 @@ def altitude_reader():
                 pass
         time.sleep(0.1)
 
-def capture_worker():
-    global running
-    cap = None
-    retry_count = 0
-    while running:
-        if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(STREAM_URL)
-        if not cap.isOpened():
-            retry_count += 1
-            if retry_count <= 3 or retry_count % 30 == 0:
-                print(f"无法连接 TCP 视频流，等待重试 ({retry_count} 次)...", flush=True)
-            time.sleep(2)
-            continue
-        retry_count = 0
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print("采集线程已启动")
-        while running:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.005)
-                continue
-            while not raw_queue.empty():
-                try: raw_queue.get_nowait()
-                except queue.Empty: break
-            raw_queue.put(frame)
+def _load_undistort_maps():
+    """预计算 remap 表 (只做一次). 失败则保持 None, 采集仍推原始帧, 不卡死."""
+    global _undistort_maps
+    if _undistort_maps is not None:
+        return
+    if not os.path.exists(USB_CALIB_NPZ):
+        print("未找到 USB 标定文件, 采集使用原始画面: %s" % USB_CALIB_NPZ, flush=True)
+        return
+    try:
+        data = np.load(USB_CALIB_NPZ)
+        K = data['camera_matrix']
+        D = data['dist_coeffs']
+        nK = data['new_camera_matrix'] if 'new_camera_matrix' in data.files else K
+        _undistort_maps = cv2.initUndistortRectifyMap(
+            K, D, None, nK, (USB_CAM_WIDTH, USB_CAM_HEIGHT), cv2.CV_16SC2)
+        print("USB 去畸变 remap 表已加载", flush=True)
+    except Exception as e:
+        print("USB 标定加载失败, 采集使用原始画面: %s" % e, flush=True)
+        _undistort_maps = None
+
+
+def _open_usb_camera():
+    """整数索引 + MJPG + 1280x720@30 + BUFFERSIZE=1.
+    python3.6 自带 OpenCV 的 VideoCapture 只接受 1 个参数, 两参数会 TypeError.
+    首次打开必须在主线程 (后台线程 open 在 Jetson 上经常不出帧).
+    """
+    idx = int(USB_CAM_INDEX)
+    try:
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+    except TypeError:
+        cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, USB_CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, USB_CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, USB_CAM_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    ok, probe = cap.read()
+    if not ok or probe is None:
+        print("USB 已打开但第一帧读取失败", flush=True)
         cap.release()
+        return None
+    aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or probe.shape[1])
+    ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or probe.shape[0])
+    print("USB 已打开 (请求 MJPG %dx%d, 实际 %dx%d, 首帧 %dx%d)" % (
+        USB_CAM_WIDTH, USB_CAM_HEIGHT, aw, ah, probe.shape[1], probe.shape[0]), flush=True)
+    return cap
+
+
+def _put_raw_latest(frame):
+    """与 test_drop_usb 相同: 覆盖最新帧, 禁止阻塞 remap/抓帧."""
+    while not raw_queue.empty():
+        try:
+            raw_queue.get_nowait()
+        except queue.Empty:
+            break
+    try:
+        raw_queue.put_nowait(frame)
+    except queue.Full:
+        pass
+
+
+def _take_usb_cap():
+    """拿走主线程已打开的 cap, 避免采集线程再 open 一次."""
+    global _usb_cap
+    cap = _usb_cap
+    _usb_cap = None
+    return cap
+
+
+def capture_worker():
+    """仿真: 原版 TCP 采集循环。真机: test_drop_usb 抓帧/remap 拆开."""
+    global running, _undistort_maps
+    if SIM_MODE:
+        cap = None
+        retry_count = 0
+        while running:
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(STREAM_URL)
+            if not cap.isOpened():
+                retry_count += 1
+                if retry_count <= 3 or retry_count % 30 == 0:
+                    print("无法连接 TCP 视频流，等待重试 (%d 次)..." % retry_count, flush=True)
+                time.sleep(2)
+                continue
+            retry_count = 0
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print("采集线程已启动", flush=True)
+            while running:
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.005)
+                    continue
+                while not raw_queue.empty():
+                    try:
+                        raw_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                raw_queue.put(frame)
+            cap.release()
+            cap = None
+        return
+
+    # ── 真机 USB: 与 test_drop_usb.py 同一套, 抓帧绝不做 remap/推理 ──
+    _load_undistort_maps()
+    latest_lock = threading.Lock()
+    latest_frame = [None]
+    latest_id = [0]
+
+    def usb_grab_loop():
+        cap = _take_usb_cap()
+        retry_count = 0
+        fail = 0
+        while running:
+            if cap is None or not cap.isOpened():
+                cap = _open_usb_camera()
+            if cap is None or not cap.isOpened():
+                retry_count += 1
+                if retry_count <= 3 or retry_count % 30 == 0:
+                    print("无法打开 USB 摄像头 /dev/video%d，等待重试 (%d 次)..." % (
+                        USB_CAM_INDEX, retry_count), flush=True)
+                time.sleep(2)
+                continue
+            retry_count = 0
+            print("USB 抓帧线程已启动 (MJPG %dx%d)" % (USB_CAM_WIDTH, USB_CAM_HEIGHT), flush=True)
+            fail = 0
+            while running:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    fail += 1
+                    if fail >= 30:
+                        print("采集连续失败, 重新打开摄像头", flush=True)
+                        break
+                    time.sleep(0.005)
+                    continue
+                fail = 0
+                copied = frame.copy()
+                with latest_lock:
+                    latest_frame[0] = copied
+                    latest_id[0] += 1
+            if cap is not None:
+                cap.release()
+                cap = None
+
+    grab_th = threading.Thread(target=usb_grab_loop, name="usb_grab", daemon=True)
+    grab_th.start()
+
+    seen_id = 0
+    while running:
+        src = None
+        with latest_lock:
+            if latest_id[0] != seen_id and latest_frame[0] is not None:
+                seen_id = latest_id[0]
+                src = latest_frame[0]
+        if src is None:
+            time.sleep(0.001)
+            continue
+        if _undistort_maps is not None:
+            mh, mw = _undistort_maps[0].shape[:2]
+            if src.shape[0] == mh and src.shape[1] == mw:
+                src = cv2.remap(src, _undistort_maps[0], _undistort_maps[1], cv2.INTER_LINEAR)
+            else:
+                print("画面尺寸 %dx%d 与 remap 表 %dx%d 不一致, 跳过去畸变" % (
+                    src.shape[1], src.shape[0], mw, mh), flush=True)
+                _undistort_maps = None
+        _put_raw_latest(src)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -786,8 +942,7 @@ def process_drop(frame, frame_count):
 
 def process_recon(frame, frame_count):
     """侦察区只转发最新视频帧；不加载模型、不运行推理、不写识别坐标。"""
-    if frame_count % 2 == 0:
-        push_ws(frame, MissionMode.RECON)
+    push_ws(frame, MissionMode.RECON)
     push_display(frame)
 
 
@@ -1170,7 +1325,7 @@ def save_worker():
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    global running, SIM_MODE, USE_DISPLAY
+    global running, SIM_MODE, USE_DISPLAY, _usb_cap
 
     SIM_MODE = "--sim" in sys.argv
     USE_DISPLAY = "--display" in sys.argv
@@ -1186,9 +1341,15 @@ def main():
     if SIM_MODE:
         print("[MODE] 仿真模式 (自动启动 gz_gst_bridge, 640x640)")
     else:
-        print("[MODE] 真机模式 (依赖外部视频流, 1280x720)")
+        print("[MODE] 真机模式 (USB /dev/video%d MJPG %dx%d, 采集端 remap)" % (
+            USB_CAM_INDEX, USB_CAM_WIDTH, USB_CAM_HEIGHT))
 
     start_camera_bridge()
+
+    if not SIM_MODE:
+        _usb_cap = _open_usb_camera()
+        if _usb_cap is None:
+            print("主线程打开 USB 失败, 采集线程将后台重试", flush=True)
 
     print("预加载 TensorRT 桶检测模型...")
     load_bucket_detector()
@@ -1223,9 +1384,13 @@ def main():
         print("\n用户中断")
         running = False
     finally:
+        running = False
         stop_camera_bridge()
         for t in threads:
             t.join(timeout=1)
+        leftover = _take_usb_cap()
+        if leftover is not None:
+            leftover.release()
         if vision_pipe_fd: vision_pipe_fd.close()
         if recon_pipe_fd:  recon_pipe_fd.close()
         if h_pipe_fd:      h_pipe_fd.close()

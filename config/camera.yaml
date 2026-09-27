@@ -1,11 +1,15 @@
 # 相机内参 (向下相机)
-# 真机: IMX219 1280x720 → fx=fy=1357 cx=640 cy=360
+# 真机: 以 scripts/detector_unified.py 为准
+#   - detector_unified.py 加载 USB 标定 NPZ 的 new_camera_matrix (无则回退 fx=fy=1357 cx=640 cy=360)
+#   - 这里必须与 detector_unified.py 运行时的“有效”内参一致, 否则建图/H降落会偏置
+#   - 安装偏移: detector_unified.py 中 CAM_DX=CAM_DY=0 (云台中心=相机中心)
+# 坐标约定: 图像右=机体右, 图像下=机体后
 camera:
   fx: 1357.0
   fy: 1357.0
   cx: 640.0
   cy: 360.0
-  # 相机在机体坐标系中的偏移 (x=前, y=右)
-  offsetForward: 0.15
+  # 相机在机体坐标系中的偏移 (x=前, y=右, z=下, 单位 m)
+  offsetForward: 0.0
   offsetRight: 0.0
   offsetDown: 0.0

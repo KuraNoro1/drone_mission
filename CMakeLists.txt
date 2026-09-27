@@ -21,6 +21,7 @@ set(SOURCE_FILES
     src/comm/servoControl.cpp
     src/control/pidController.cpp
     src/control/dualLoopPid.cpp
+    src/control/pixelServo.cpp
     src/vision/visionInterface.cpp
     src/mission/missionConfig.cpp
     src/mission/missionStateMachine.cpp
@@ -38,6 +39,7 @@ set(HEADER_FILES
     include/comm/servoControl.h
     include/control/pidController.h
     include/control/dualLoopPid.h
+    include/control/pixelServo.h
     include/vision/visionInterface.h
     include/mission/missionConfig.h
     include/mission/missionStateMachine.h

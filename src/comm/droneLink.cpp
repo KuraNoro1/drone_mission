@@ -76,16 +76,6 @@ bool droneLink::connect() {
         latestPitchDeg_ = euler.pitch_deg;
     });
 
-    if (altPipeFd_ >= 0) {
-        telemetry_->subscribe_position([this](Telemetry::Position pos) {
-            static int skip = 0;
-            if (++skip % 5 != 0) return;  // 10Hz → 2Hz 写入
-            std::string s = std::to_string(pos.relative_altitude_m) + "\n";
-            auto ret = ::write(altPipeFd_, s.c_str(), s.size());
-            (void)ret;
-        });
-    }
-
     connected_ = true;
     log("Connected. Mode=" + std::to_string(static_cast<int>(telemetry_->flight_mode())));
     return true;
@@ -94,20 +84,38 @@ bool droneLink::connect() {
 bool droneLink::isConnected() const { return connected_; }
 
 void droneLink::enableAltitudePipe(const std::string& path) {
+    if (altPipeFd_ >= 0) return;   // 幂等: 已启用则忽略
+
     altPipePath_ = path;
-    ::unlink(path.c_str());
-    ::mkfifo(path.c_str(), 0666);
-    // 阻塞等待 Python 端打开读端 (最多重试30次×200ms=6s)
+    // 只创建缺失的 FIFO, 绝不能 unlink 重建 —— Python 可能已 open 旧 inode,
+    // 重建会导致两端指向不同 FIFO (历史 bug)
+    if (::mkfifo(path.c_str(), 0666) != 0 && errno != EEXIST) {
+        log("WARNING: altitude pipe mkfifo: " + std::string(strerror(errno)));
+    }
+
+    // 等待 Python 端打开读端后以写端接入 (最多重试30次×200ms=6s)
     for (int retry = 0; retry < 30; ++retry) {
         altPipeFd_ = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
-        if (altPipeFd_ >= 0) {
-            log("Altitude pipe opened: " + path);
-            return;
-        }
+        if (altPipeFd_ >= 0) break;
         sleep_for(milliseconds(200));
     }
-    log("WARNING: Cannot open altitude pipe: " + path +
-        " (" + std::string(strerror(errno)) + ")");
+    if (altPipeFd_ < 0) {
+        log("WARNING: Cannot open altitude pipe: " + path +
+            " (" + std::string(strerror(errno)) + ")");
+        return;
+    }
+    log("Altitude pipe opened: " + path);
+
+    // ⚠️ 订阅必须在此注册: connect() 执行时 altPipeFd_ 尚为 -1,
+    //    原先放在 connect() 里导致高度永远不会写入管道
+    telemetry_->subscribe_position([this](Telemetry::Position pos) {
+        static int skip = 0;
+        if (++skip % 5 != 0) return;  // 10Hz → 2Hz 写入
+        if (altPipeFd_ < 0) return;
+        std::string s = std::to_string(pos.relative_altitude_m) + "\n";
+        auto ret = ::write(altPipeFd_, s.c_str(), s.size());
+        (void)ret;
+    });
 }
 
 double droneLink::altitude() const {

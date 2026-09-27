@@ -148,9 +148,10 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
     log("Yaw bias (headingDeg - initYaw): " + std::to_string(yawBias_).substr(0,5) + " deg");
     loopStart_ = steady_clock::now();
 
-    if (!pidX_) {
-        pidX_ = std::make_unique<pidController>(cfg_.kpXY, 0.15, 0, cfg_.maxVelXY, 0.5);
-        pidY_ = std::make_unique<pidController>(cfg_.kpXY, 0.15, 0, cfg_.maxVelXY, 0.5);
+    // 共享像素伺服: 与 RTL-H 降落同一实现 (kp 来自 pid.yaml, ki=0.15 与历史一致)
+    pixelServo_.configure(cfg_.kpXY, 0.15, 0.0, cfg_.maxVelXY,
+                     intrinsics_.cx, intrinsics_.cy);
+    if (!tracker_) {
         tracker_ = std::make_unique<TargetTracker>();
     }
 
@@ -481,8 +482,7 @@ bool BombDropSystem::centerAboveTarget() {
         std::to_string(target.world.east).substr(0,4) + ")");
 
     tracker_->lockTarget(target.bucketId, target.world);
-    pidX_->reset();
-    pidY_->reset();
+    pixelServo_.reset();
     lastHasPix_ = false;
 
     if (!offboard_.startVelocityMode()) {
@@ -509,13 +509,9 @@ bool BombDropSystem::centerAboveTarget() {
     const int    CONV_WIN = 20;          // 1.0s @ 50ms, 跨越典型检测间隔
     const int    CONV_MIN = 4;           // 日志数据 ~15-25% 命中率, 20 帧窗口期望 3-5 命中
     const double MAX_MATCH_PX = 600.0;   // 距画面中心的最大接受距离, 滤除极端误检
-    const double CONF_HIGH = 0.20;
-    const double CONF_DECAY = 4.0;
-    const double CONF_MIN = 0.65;
 
     int  convHist[20] = {0};
     int  convIdx = 0, convCnt = 0, frameCnt = 0;
-    auto lastPixTime = t0;
     char buf[256];
 
     while (true) {
@@ -541,34 +537,12 @@ bool BombDropSystem::centerAboveTarget() {
             }
         }
 
-        // ── 时间衰减置信度 (管道空/丢目标时不骤降) ──
-        if (hasPix) {
-            lastPixTime = steady_clock::now();
-        }
-        // 管道为空 (非阻塞读无新数据) 保持 lastPixTime 不变
-        // 管道有数据但无匹配 → 也会自动老化 lastPixTime
-        double sincePix = duration<double>(steady_clock::now() - lastPixTime).count();
-        double confidence;
-        if (sincePix < CONF_HIGH) {
-            confidence = 1.0;
-        } else {
-            double frac = std::min(1.0, (sincePix - CONF_HIGH) / CONF_DECAY);
-            confidence = 1.0 - frac * (1.0 - CONF_MIN);
-        }
+        // ── 水平控制: 共享像素伺服 (含时间衰减置信度; 丢失时原地悬停) ──
+        double vx = 0, vy = 0, pixelErr = 1e9, confidence = 0.0;
+        pixelServo_.step(hasPix, pixCx, pixCy, ds.alt, correctedYawDeg(),
+                    0.05, 1.0, vx, vy, pixelErr, confidence);
+        double sincePix = pixelServo_.sinceLastSeen();
 
-    // ── 水平控制: 像素伺服 (视觉丢失时原地悬停) ──
-        double vx = 0, vy = 0;
-        if (hasPix && confidence > 0.01) {
-            double errU = (pixCx - cx) / cx;
-            double errV = (pixCy - cy) / cy;
-            double bodyFwd = pidX_->update( errV, 0.05);
-            double bodyRgt = pidY_->update( errU, 0.05);
-            bodyFwd *= confidence;
-            bodyRgt *= confidence;
-            double yawRad = correctedYawDeg() * M_PI / 180.0;
-            vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
-            vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-        }
         // ── 垂直控制 ──
         double vz = cfg_.kpZ * (ds.alt - cfg_.approachAlt);
         vz = std::max(-cfg_.maxVelZ, std::min(cfg_.maxVelZ, vz));
@@ -576,7 +550,6 @@ bool BombDropSystem::centerAboveTarget() {
         offboard_.setVelocityNed(static_cast<float>(vx), static_cast<float>(vy),
                                  static_cast<float>(vz), initYaw_);
 
-        double pixelErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
         bool converged = hasPix && pixelErr < CONVERGE_TOL_PX;
 
         frameCnt++;
@@ -624,9 +597,6 @@ bool BombDropSystem::descendAndDrop() {
     const double LOST_TIMEOUT = 5.0;
     const double DESCENT_RATE = 0.3;
     const double MAX_MATCH_PX = 600.0;
-    const double CONF_HIGH = 0.20;
-    const double CONF_DECAY = 4.0;
-    const double CONF_MIN = 0.65;
 
     bool reachedDropAlt = false;
     bool alignVerified = false;
@@ -643,7 +613,6 @@ bool BombDropSystem::descendAndDrop() {
     int  dropHist[10] = {0};
     int  dropIdx = 0, dropCnt = 0, dropFrameCnt = 0;
 
-    auto lastPixTime = t0;
     char buf[256];
 
     while (true) {
@@ -668,42 +637,15 @@ bool BombDropSystem::descendAndDrop() {
             }
         }
 
-        // ── 时间衰减置信度 ──
-        if (hasPix) {
-            lastPixTime = steady_clock::now();
-        }
-        double sincePix = duration<double>(steady_clock::now() - lastPixTime).count();
-        double confidence;
-        if (sincePix < CONF_HIGH) {
-            confidence = 1.0;
-        } else {
-            double frac = std::min(1.0, (sincePix - CONF_HIGH) / CONF_DECAY);
-            confidence = 1.0 - frac * (1.0 - CONF_MIN);
-        }
-
-        // ── 水平控制: 像素伺服 (视觉丢失时原地悬停) ──
-        double vx = 0, vy = 0;
-        if (hasPix && confidence > 0.01) {
-            double errU = (pixCx - cx) / cx;
-            double errV = (pixCy - cy) / cy;
-            double bodyFwd = pidX_->update( errV, 0.05);
-            double bodyRgt = pidY_->update( errU, 0.05);
-            bodyFwd *= confidence;
-            bodyRgt *= confidence;
-            double yawRad = correctedYawDeg() * M_PI / 180.0;
-            vx = bodyFwd * std::cos(yawRad) - bodyRgt * std::sin(yawRad);
-            vy = bodyFwd * std::sin(yawRad) + bodyRgt * std::cos(yawRad);
-        }
-        double maxVel = cfg_.maxVelXY * 0.5;
-        double vMag = std::hypot(vx, vy);
-        if (vMag > maxVel && vMag > 0.001) {
-            vx = vx / vMag * maxVel; vy = vy / vMag * maxVel;
-        }
+        // ── 水平控制: 共享像素伺服 (PID 从 CENTER 连续, 限半速) ──
+        double vx = 0, vy = 0, pixelErr = 1e9, confidence = 0.0;
+        pixelServo_.step(hasPix, pixCx, pixCy, ds.alt, correctedYawDeg(),
+                    0.05, 0.5, vx, vy, pixelErr, confidence);
+        double sincePix = pixelServo_.sinceLastSeen();
 
         // ── 下降前对齐验证 ──
         if (!alignVerified) {
-            double pixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
-            bool alignOk = hasPix && pixErr < ALIGN_TOL_PX;
+            bool alignOk = hasPix && pixelErr < ALIGN_TOL_PX;
             alignFrameCnt++;
             alignCnt -= alignHist[alignIdx];
             alignHist[alignIdx] = alignOk ? 1 : 0;
@@ -712,7 +654,7 @@ bool BombDropSystem::descendAndDrop() {
             if (alignFrameCnt >= ALIGN_WIN && alignCnt >= ALIGN_MIN) {
                 alignVerified = true;
                 std::snprintf(buf, sizeof(buf), "DESCEND: pre-align %d/%d pixErr=%.0fpx",
-                              alignCnt, ALIGN_WIN, pixErr);
+                              alignCnt, ALIGN_WIN, pixelErr);
                 log(buf);
             }
         }
@@ -745,7 +687,6 @@ bool BombDropSystem::descendAndDrop() {
         }
 
         if (reachedDropAlt) {
-            double pixelErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : 1e9;
             double velMag = std::hypot(ds.vx, ds.vy);
             bool pixOk = hasPix && pixelErr < DROP_TOL_PX;
             bool velOk = velMag < cfg_.velZeroTol;

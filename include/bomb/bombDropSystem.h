@@ -11,6 +11,7 @@
 #include "comm/offboardControl.h"
 #include "comm/servoControl.h"
 #include "control/pidController.h"
+#include "control/pixelServo.h"
 #include "vision/visionInterface.h"
 
 struct DropConfig {
@@ -47,6 +48,10 @@ public:
     BombDropResult execute(double totalTimeout, float initYaw);
     void reset();
     int getDropCount() const { return dropCount_; }
+
+    // 经航向校准后的当前机头航向 (deg, headingDeg - yawBias_)
+    // 供任务层 (H 降落引导) 使用, 保证与投放链路同一航向基准
+    double correctedYawDeg() const;
 
 private:
     enum class Phase { SCAN, SELECT, GOTO, CENTER, DESCEND, CLIMB, DONE };
@@ -94,7 +99,6 @@ private:
     std::vector<std::string> droppedSides_;
     float initYaw_;
     double yawBias_;        // headingDeg - initYaw_ (航向角校准偏置)
-    double correctedYawDeg() const;  // 返回经校准的航向角 (deg)
 
     // 目标地图
     struct MapEntry { WorldTarget world; int bucketId; double score; bool used; };
@@ -105,9 +109,8 @@ private:
     // 目标跟踪器
     std::unique_ptr<TargetTracker> tracker_;
 
-    // PID
-    std::unique_ptr<pidController> pidX_;
-    std::unique_ptr<pidController> pidY_;
+    // 水平像素伺服 (与 RTL-H 降落共用)
+    pixelServo pixelServo_;
 
     std::chrono::steady_clock::time_point loopStart_;
 
