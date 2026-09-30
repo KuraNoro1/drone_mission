@@ -100,13 +100,16 @@ if os.path.exists(CALIB_NPZ_PATH):
         CAM_CX_REAL = float(_K[0, 2])
         CAM_CY_REAL = float(_K[1, 2])
         print(f"✅ 已加载相机标定 ({os.path.basename(CALIB_NPZ_PATH)}): FX={CAM_FX_REAL:.1f}, FY={CAM_FY_REAL:.1f}, CX={CAM_CX_REAL:.1f}, CY={CAM_CY_REAL:.1f}")
+        print(f"⚠️ 请确认 C++ config/camera.yaml 与上述内参一致, 否则建图/H降落存在偏置")
     except Exception as e:
         print(f"⚠️ 标定文件加载失败: {e}，使用默认值")
         CAM_FX_REAL, CAM_FY_REAL = 1357.0, 1357.0
         CAM_CX_REAL, CAM_CY_REAL = 640.0, 360.0
+        print(f"⚠️ 使用默认内参 FX={CAM_FX_REAL:.1f}, FY={CAM_FY_REAL:.1f}, CX={CAM_CX_REAL:.1f}, CY={CAM_CY_REAL:.1f}")
 else:
     CAM_FX_REAL, CAM_FY_REAL = 1357.0, 1357.0
     CAM_CX_REAL, CAM_CY_REAL = 640.0, 360.0
+    print(f"⚠️ 未找到标定文件 ({CALIB_NPZ_PATH})，使用默认内参 FX={CAM_FX_REAL:.1f}, FY={CAM_FY_REAL:.1f}, CX={CAM_CX_REAL:.1f}, CY={CAM_CY_REAL:.1f}")
 
 # ── 仿真向下相机 ──
 CAM_FX_SIM   = 554.26; CAM_FY_SIM   = 554.26

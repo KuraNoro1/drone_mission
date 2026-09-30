@@ -22,6 +22,34 @@ namespace {
     static const char* bucketLabel(int id) {
         switch (id) { case 1: return "15cm"; case 2: return "20cm"; case 3: return "25cm"; default: return "?"; }
     }
+
+    // 目标与无人机当前位置的合理距离上限 (m)。
+    // 扫描高度 3.5m + 相机 fx=1357/1280x720, 地面覆盖仅约 3.3m x 1.86m
+    // (对角最远 ~1.9m), 合法可观测目标恒在正下方数米内。
+    // 取 10m 留足姿态/漂移/多桶间距余量, 又能拒绝中量级错位坐标。
+    constexpr double kMaxTargetDistM = 10.0;
+
+    // 视觉目标像素匹配: 优先匹配锁定桶 ID, 未找到时回退到离图像中心最近
+    static bool pickTargetPixel(const multiBucketData& vis, int lockedId,
+                                double cx, double cy, double maxMatchPx,
+                                double& pixCx, double& pixCy) {
+        double bestDist = maxMatchPx;
+        bool hasPix = false;
+        if (lockedId > 0) {
+            for (const auto& b : vis.buckets) {
+                if (b.bucketId != lockedId) continue;
+                double d = std::hypot(b.cx - cx, b.cy - cy);
+                if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
+            }
+        }
+        if (!hasPix) {
+            for (const auto& b : vis.buckets) {
+                double d = std::hypot(b.cx - cx, b.cy - cy);
+                if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
+            }
+        }
+        return hasPix;
+    }
 }
 
 // ── 构造/配置 ──────────────────────────────────────────────
@@ -271,12 +299,15 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
     // 像素聚类: 按位置而非YOLO标签跟踪
     struct ClusterTrack { double cx=0, cy=0; std::map<int,int> idVotes;
-                          int stableFrames=0; double sumN=0, sumE=0; int worldSamples=0; };
+                          int stableFrames=0; int missingFrames=0;
+                          double sumN=0, sumE=0; int worldSamples=0; };
     std::map<int, ClusterTrack> clusters;
     int nextClusterId = 0;
     const double CLUSTER_RADIUS = 50.0;
     const int STABLE_FRAMES = 3;
     const int MIN_WORLD_SAMPLES = 3;
+    // 丢帧迟滞: 连续 N 帧未匹配才删除该簇, 容忍低命中率下的间歇漏检
+    const int MAX_MISSING_FRAMES = 10;   // 1.0s @ 100ms/帧
 
     auto hold = link_.nedPosition();
     double holdN = hold.northM;
@@ -340,6 +371,7 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             else
                 cl.stableFrames = 1;
             cl.cx = nCx; cl.cy = nCy;
+            cl.missingFrames = 0;   // 本帧匹配上, 清除丢帧计数
             for (const auto& d : dets) cl.idVotes[d.bucketId]++;
 
             // 稳定后累积世界坐标 (多帧平均消除姿态抖动)
@@ -350,23 +382,26 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
                 double pitchRad = link_.attitudePitchDeg() * M_PI / 180.0;
                 WorldTarget wt = pixelToWorld(cl.cx, cl.cy, 0, intrinsics_, extrinsics_,
                                                alt, rollRad, pitchRad, yawRad, ned.northM, ned.eastM);
-                if (wt.valid) {
-                    double maxRange = 20.0;
-                    if (std::abs(wt.north - ned.northM) < maxRange &&
-                        std::abs(wt.east  - ned.eastM)  < maxRange) {
-                        cl.sumN += wt.north;
-                        cl.sumE += wt.east;
-                        cl.worldSamples++;
-                    }
+                // 单样本合理性: 与建图/GOTO 使用同一距离上限, 避免过松样本污染平均值
+                if (worldTargetWithinRange(wt, ned.northM, ned.eastM, kMaxTargetDistM)) {
+                    cl.sumN += wt.north;
+                    cl.sumE += wt.east;
+                    cl.worldSamples++;
                 }
             }
         }
 
-        // 清除未匹配簇
-        for (auto it = clusters.begin(); it != clusters.end(); )
-            if (matchedIds.find(it->first) == matchedIds.end())
-                it = clusters.erase(it);
-            else ++it;
+        // 清除未匹配簇 (丢帧迟滞: 连续 MAX_MISSING_FRAMES 帧未匹配才删)
+        for (auto it = clusters.begin(); it != clusters.end(); ) {
+            if (matchedIds.find(it->first) == matchedIds.end()) {
+                if (++it->second.missingFrames > MAX_MISSING_FRAMES)
+                    it = clusters.erase(it);
+                else
+                    ++it;
+            } else {
+                ++it;
+            }
+        }
 
         sleep_for(milliseconds(100));
     }
@@ -379,7 +414,21 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
         for (const auto& [id, v] : cl.idVotes)
             if (v > bestV) { bestV = v; bestId = id; }
 
-        WorldTarget wt{true, cl.sumN / cl.worldSamples, cl.sumE / cl.worldSamples};
+        WorldTarget wt = makeWorldTarget(cl.sumN / cl.worldSamples,
+                                         cl.sumE / cl.worldSamples, 0.0);
+
+        // 入图保护: valid / 有限数 / 与无人机当前位置的距离上限
+        auto nedNow = link_.nedPosition();
+        double distToDrone = std::hypot(wt.north - nedNow.northM,
+                                        wt.east  - nedNow.eastM);
+        if (!worldTargetWithinRange(wt, nedNow.northM, nedNow.eastM, kMaxTargetDistM)) {
+            log("  Map: REJECT 桶" + std::string(bucketLabel(bestId)) +
+                " valid=" + std::to_string(wt.valid) +
+                " @(" + std::to_string(wt.north).substr(0,5) + "," +
+                std::to_string(wt.east).substr(0,5) + ") dist=" +
+                std::to_string(distToDrone).substr(0,5) + "m (abnormal, skipped)");
+            continue;
+        }
 
         bool dup = false;
         for (const auto& e : targetMap_)
@@ -390,7 +439,8 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
             log("  Map: 桶" + std::string(bucketLabel(bestId)) +
                 " @(" + std::to_string(wt.north).substr(0,5) + "," +
                 std::to_string(wt.east).substr(0,5) + ") votes=" +
-                std::to_string(bestV) + " samples=" + std::to_string(cl.worldSamples));
+                std::to_string(bestV) + " samples=" + std::to_string(cl.worldSamples) +
+                " valid=1 dist=" + std::to_string(distToDrone).substr(0,5) + "m");
         }
     }
 
@@ -404,16 +454,28 @@ bool BombDropSystem::scanForTargets(double timeoutSec) {
 
 bool BombDropSystem::selectNextTarget() {
     for (size_t i = 0; i < targetMap_.size(); ++i) {
-        if (!targetMap_[i].used) {
-            currentTargetIdx_ = static_cast<int>(i);
-            targetMap_[i].used = true;
-            const auto& w = targetMap_[i].world;
-            log("Selected #" + std::to_string(i) + ": 桶" +
+        if (targetMap_[i].used) continue;
+
+        const auto& w = targetMap_[i].world;
+        auto ned = link_.nedPosition();
+        double distToDrone = std::hypot(w.north - ned.northM, w.east - ned.eastM);
+        if (!worldTargetWithinRange(w, ned.northM, ned.eastM, kMaxTargetDistM)) {
+            targetMap_[i].used = true;   // 无效目标不再重试
+            log("Selected #" + std::to_string(i) + ": REJECT 桶" +
                 std::string(bucketLabel(targetMap_[i].bucketId)) +
-                " @(" + std::to_string(w.north).substr(0,5) + "," +
-                std::to_string(w.east).substr(0,5) + ")");
-            return true;
+                " valid=" + std::to_string(w.valid) + " dist=" +
+                std::to_string(distToDrone).substr(0,5) + "m (abnormal, skipped)");
+            continue;
         }
+
+        currentTargetIdx_ = static_cast<int>(i);
+        targetMap_[i].used = true;
+        log("Selected #" + std::to_string(i) + ": 桶" +
+            std::string(bucketLabel(targetMap_[i].bucketId)) +
+            " @(" + std::to_string(w.north).substr(0,5) + "," +
+            std::to_string(w.east).substr(0,5) + ") valid=1 dist=" +
+            std::to_string(distToDrone).substr(0,5) + "m");
+        return true;
     }
     return false;
 }
@@ -422,11 +484,28 @@ bool BombDropSystem::selectNextTarget() {
 
 bool BombDropSystem::gotoWorldTarget() {
     const auto& target = targetMap_[currentTargetIdx_];
+    const WorldTarget& w = target.world;
     double approachAlt = cfg_.approachAlt;
+    auto nedStart = link_.nedPosition();
+    double distToDrone = std::hypot(w.north - nedStart.northM,
+                                    w.east  - nedStart.eastM);
+
     log("GOTO: 桶" + std::string(bucketLabel(target.bucketId)) +
-        " @world(" + std::to_string(target.world.north).substr(0,5) + "," +
-        std::to_string(target.world.east).substr(0,5) + ") at " +
-        std::to_string(approachAlt) + "m");
+        " @world(" + std::to_string(w.north).substr(0,5) + "," +
+        std::to_string(w.east).substr(0,5) + ") at " +
+        std::to_string(approachAlt) + "m curNED(" +
+        std::to_string(nedStart.northM).substr(0,5) + "," +
+        std::to_string(nedStart.eastM).substr(0,5) + ") valid=" +
+        std::to_string(w.valid) + " dist=" +
+        std::to_string(distToDrone).substr(0,5) + "m");
+
+    // 发送 PX4 setpoint 前保护: valid / 有限数 / 距离上限
+    if (!worldTargetWithinRange(w, nedStart.northM, nedStart.eastM, kMaxTargetDistM)) {
+        log("GOTO: REJECT abnormal target (valid=" + std::to_string(w.valid) +
+            " dist=" + std::to_string(distToDrone).substr(0,5) +
+            "m), no setpoint sent, holding in place");
+        return false;
+    }
 
     if (!offboard_.startPositionModeAt(
             static_cast<float>(target.world.north),
@@ -526,15 +605,12 @@ bool BombDropSystem::centerAboveTarget() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 目标匹配: 取画面中心最近的检测, 消除对 SCAN 世界坐标精度的依赖 ──
+        // ── 目标匹配: 优先锁定桶ID, 未找到时取画面中心最近检测 ──
         bool hasPix = false;
         double pixCx = 0, pixCy = 0;
         if (!vis.empty()) {
-            double bestDist = MAX_MATCH_PX;
-            for (const auto& b : vis.buckets) {
-                double d = std::hypot(b.cx - cx, b.cy - cy);
-                if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
-            }
+            hasPix = pickTargetPixel(vis, tracker_->getLockedId(),
+                                     cx, cy, MAX_MATCH_PX, pixCx, pixCy);
         }
 
         // ── 水平控制: 共享像素伺服 (含时间衰减置信度; 丢失时原地悬停) ──
@@ -626,15 +702,12 @@ bool BombDropSystem::descendAndDrop() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 目标匹配: 取画面中心最近的检测 ──
+        // ── 目标匹配: 优先锁定桶ID, 未找到时取画面中心最近检测 ──
         bool hasPix = false;
         double pixCx = 0, pixCy = 0;
         if (!vis.empty()) {
-            double bestDist = MAX_MATCH_PX;
-            for (const auto& b : vis.buckets) {
-                double d = std::hypot(b.cx - cx, b.cy - cy);
-                if (d < bestDist) { bestDist = d; pixCx = b.cx; pixCy = b.cy; hasPix = true; }
-            }
+            hasPix = pickTargetPixel(vis, tracker_->getLockedId(),
+                                     cx, cy, MAX_MATCH_PX, pixCx, pixCy);
         }
 
         // ── 水平控制: 共享像素伺服 (PID 从 CENTER 连续, 限半速) ──

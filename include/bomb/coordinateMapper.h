@@ -21,6 +21,17 @@ struct WorldTarget {
     bool valid;       // whether the result is valid
 };
 
+// ── WorldTarget 构造/校验工具 (避免裸聚合初始化的字段错位) ──
+// 工厂函数: 按字段语义显式赋值, 禁止依赖声明顺序
+WorldTarget makeWorldTarget(double north, double east, double diameter);
+
+// 有效性: valid==true 且 north/east 为有限数
+bool worldTargetValid(const WorldTarget& wt);
+
+// 合理性: 有效且相对参考点 (无人机当前位置) 的 N/E 偏移均在 maxDist 内
+bool worldTargetWithinRange(const WorldTarget& wt,
+                            double refNorth, double refEast, double maxDist);
+
 // ── 3x3 旋转矩阵 ────────────────────────────────────────
 struct Matrix33 {
     double m[9];

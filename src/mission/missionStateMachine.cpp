@@ -100,6 +100,11 @@ bool missionStateMachine::init() {
         camExtrinsics.offsetRight   = config_.camera.offsetRight;
         camExtrinsics.offsetDown    = config_.camera.offsetDown;
 
+        log("Camera intrinsics (C++ config/camera.yaml): fx=" +
+            std::to_string(camIntrinsics.fx) + " fy=" + std::to_string(camIntrinsics.fy) +
+            " cx=" + std::to_string(camIntrinsics.cx) + " cy=" + std::to_string(camIntrinsics.cy) +
+            " (must match detector_unified.py runtime K)");
+
         bombSystem_->configure(dropCfg, camIntrinsics, camExtrinsics, missionPriority_);
     }
 

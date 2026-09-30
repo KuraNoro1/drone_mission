@@ -19,12 +19,17 @@ void TargetTracker::lockTarget(int bucketId) {
 
 void TargetTracker::lockTarget(int bucketId, const WorldTarget& initialPos) {
     lockedBucketId_ = bucketId;
-    // 初始化轨迹，世界坐标直接使用传入值
-    track_ = {bucketId, initialPos, 0, 0, 0, 0, TargetState::VISIBLE, false, 0, 0, 0, 0};
-    track_.worldPos.valid = true;
+    // 初始化轨迹, 世界坐标使用传入值; 不无条件置 valid —— 明显无效的目标保持无效
+    track_ = {bucketId, initialPos, 0, 0, 0, 0, TargetState::LOST_CRITICAL, false, 0, 0, 0, 0};
+    track_.worldPos.valid = worldTargetValid(initialPos);
     track_.lastSeenTime = 0.0;   // 初始时刻视为刚看到
-    // 初始化 Kalman 滤波器
-    kf_.init(initialPos.north, initialPos.east);
+    if (track_.worldPos.valid) {
+        // 初始化 Kalman 滤波器
+        kf_.init(initialPos.north, initialPos.east);
+        track_.state = TargetState::VISIBLE;
+    } else {
+        kf_.reset();
+    }
 }
 
 void TargetTracker::unlock() {

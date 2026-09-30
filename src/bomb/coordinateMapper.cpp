@@ -1,5 +1,27 @@
 #include "coordinateMapper.h"
 
+// ── WorldTarget 工厂与校验 ────────────────────────────────
+
+WorldTarget makeWorldTarget(double north, double east, double diameter) {
+    WorldTarget wt;
+    wt.north = north;
+    wt.east = east;
+    wt.diameter = diameter;
+    wt.valid = true;
+    return wt;
+}
+
+bool worldTargetValid(const WorldTarget& wt) {
+    return wt.valid && std::isfinite(wt.north) && std::isfinite(wt.east);
+}
+
+bool worldTargetWithinRange(const WorldTarget& wt,
+                            double refNorth, double refEast, double maxDist) {
+    return worldTargetValid(wt) &&
+           std::abs(wt.north - refNorth) <= maxDist &&
+           std::abs(wt.east  - refEast)  <= maxDist;
+}
+
 // ── Matrix33 ────────────────────────────────────────────
 
 Matrix33::Matrix33() {
