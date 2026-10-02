@@ -20,7 +20,11 @@ public:
 
     void configure(double kp, double ki, double kd, double maxVel,
                    double imgCx, double imgCy);
-    void reset();   // PID 清零 + 置信度计时重置
+    void reset();   // PID 清零 + 置信度计时重置 + 目标点复位到图像中心
+
+    // 设定伺服目标像素 (默认 = 图像主点/相机光轴).
+    // 投放时传入挂载点投影像素, 即可让挂载点而非相机中心对准目标.
+    void setTarget(double u, double v);
 
     // 一次伺服. hasPix=false 时 vx=vy=0 (原地悬停).
     // velScale: 速度上限缩放 (descend 用 0.5).
@@ -37,6 +41,8 @@ private:
     std::unique_ptr<pidController> pidRgt_;   // 机体右向
     double imgCx_ = 640.0;
     double imgCy_ = 360.0;
+    double tgtU_ = 640.0;   // 伺服目标像素 (默认=图像主点)
+    double tgtV_ = 360.0;
     double maxVel_ = 0.5;
 
     std::chrono::steady_clock::time_point lastSeenTime_;

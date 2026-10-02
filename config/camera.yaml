@@ -1,15 +1,22 @@
 # 相机内参 (向下相机)
 # 真机: 以 scripts/detector_unified.py 为准
 #   - detector_unified.py 加载 USB 标定 NPZ 的 new_camera_matrix (无则回退 fx=fy=1357 cx=640 cy=360)
+#   - 当前 USB 摄像头实测标定: FX=811.4, FY=936.3, CX=700.5, CY=383.0
 #   - 这里必须与 detector_unified.py 运行时的“有效”内参一致, 否则建图/H降落会偏置
-#   - 安装偏移: detector_unified.py 中 CAM_DX=CAM_DY=0 (云台中心=相机中心)
 # 坐标约定: 图像右=机体右, 图像下=机体后
 camera:
-  fx: 1357.0
-  fy: 1357.0
-  cx: 640.0
-  cy: 360.0
+  fx: 811.4
+  fy: 936.3
+  cx: 700.5
+  cy: 383.0
   # 相机在机体坐标系中的偏移 (x=前, y=右, z=下, 单位 m)
-  offsetForward: 0.0
+  offsetForward: 0.088   # 相机在机体正中心前方 8.8cm
   offsetRight: 0.0
   offsetDown: 0.0
+
+# 两个投水舵机挂载点 (释放点) 在机体坐标系中的位置 (x=前, y=右, 单位 m)
+mount:
+  leftForward: 0.0
+  leftRight: -0.075      # 机体正中心左侧 7.5cm
+  rightForward: 0.0
+  rightRight: 0.075      # 机体正中心右侧 7.5cm

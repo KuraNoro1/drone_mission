@@ -39,9 +39,9 @@ FX = 1357.0
 FY = 1357.0
 CX = 640.0
 CY = 360.0
-CAM_DX, CAM_DY = 0.0, 0.0   # 与 detector_unified.py 一致: 云台中心=相机中心
-MNT_LX, MNT_LY = -0.07, 0.001
-MNT_RX, MNT_RY = 0.07, -0.001
+CAM_FWD, CAM_RIGHT = 0.088, 0.0          # 相机偏移 (前方 8.8cm), 与 config/camera.yaml 一致
+MNT_LEFT_FWD, MNT_LEFT_RIGHT = 0.0, -0.075   # 左挂载点 (左侧 7.5cm)
+MNT_RIGHT_FWD, MNT_RIGHT_RIGHT = 0.0, 0.075  # 右挂载点 (右侧 7.5cm)
 WORLD_R = 0.10
 ALT_PIPE = "/tmp/altitude_pipe"
 CURRENT_ALTITUDE = 1.5  # 默认值, 管道更新后覆盖
@@ -131,14 +131,19 @@ def classify_bucket_id(pixel_width, cx, cy):
 def compute_mount_pixels(altitude):
     if altitude < 0.1:
         altitude = 0.1
-    offsetL = np.sqrt((MNT_LX - CAM_DX) ** 2 + (MNT_LY - CAM_DY) ** 2)
-    offsetR = np.sqrt((MNT_RX - CAM_DX) ** 2 + (MNT_RY - CAM_DY) ** 2)
+    relFwdL = MNT_LEFT_FWD - CAM_FWD
+    relRightL = MNT_LEFT_RIGHT - CAM_RIGHT
+    relFwdR = MNT_RIGHT_FWD - CAM_FWD
+    relRightR = MNT_RIGHT_RIGHT - CAM_RIGHT
+    offsetL = np.sqrt(relFwdL ** 2 + relRightL ** 2)
+    offsetR = np.sqrt(relFwdR ** 2 + relRightR ** 2)
     slantL = np.sqrt(altitude * altitude + offsetL * offsetL)
     slantR = np.sqrt(altitude * altitude + offsetR * offsetR)
-    uL = CX + FX * (MNT_LX - CAM_DX) / altitude
-    vL = CY + FY * (MNT_LY - CAM_DY) / altitude
-    uR = CX + FX * (MNT_RX - CAM_DX) / altitude
-    vR = CY + FY * (MNT_RY - CAM_DY) / altitude
+    # 坐标约定: 图像右=机体右, 图像下=机体后
+    uL = CX + FX * relRightL / altitude
+    vL = CY - FY * relFwdL / altitude
+    uR = CX + FX * relRightR / altitude
+    vR = CY - FY * relFwdR / altitude
     radius = WORLD_R * FX / ((slantL + slantR) * 0.5)
     return uL, vL, uR, vR, radius
 

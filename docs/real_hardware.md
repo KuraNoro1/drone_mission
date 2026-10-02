@@ -57,7 +57,7 @@ PWM 参数配置见 `config/servo.yaml`。
 - 分辨率: 1280×720 @ 30fps
 - FOV: 约 60° (与 D 版镜头一致)
 - 安装: 机体正下方，镜头朝下 (nadir)
-- 安装偏移: 以 `scripts/detector_unified.py` 为准 (CAM_DX=CAM_DY=0, 云台中心=相机中心), 同步到 `config/camera.yaml`
+- 安装偏移: 以 `config/camera.yaml` 为准 (相机在机体正中心前方 8.8cm: `offsetForward=0.088`, 挂载点左右 7.5cm), 同步到 `scripts/detector_unified.py`
 
 ### 2.4 供电
 

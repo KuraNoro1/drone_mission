@@ -180,7 +180,7 @@ count=0 时只有 1 字节
 相机: OpenCV标准 (X右, Y下, Z前)
   - 安装: 朝下 (nadir)
   - 内参: 以 scripts/detector_unified.py 为准 (USB 标定 NPZ 的 new_camera_matrix, 回退 fx=fy=1357, cx=640, cy=360)
-  - 安装偏移: config/camera.yaml (与 detector_unified 的 CAM_DX/CAM_DY 一致, 当前为 0)
+  - 安装偏移: config/camera.yaml (与 detector_unified 的 CAM_FWD/CAM_RIGHT 一致, 相机前 8.8cm)
 
 机体: 前(North), 右(East), 下(Down)
 

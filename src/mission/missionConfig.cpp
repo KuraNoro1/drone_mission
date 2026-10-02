@@ -2,6 +2,9 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <thread>
+#include <fstream>
+#include <map>
 
 using namespace std::chrono;
 
@@ -37,6 +40,8 @@ bool missionConfig::load() {
         parseVision(loadFile("vision.yaml")["vision"]);
         parseServo(loadFile("servo.yaml")["servo"]);
         parseCamera(loadFile("camera.yaml")["camera"]);
+        parseMount(loadFile("camera.yaml")["mount"]);
+        applyRuntimeCameraParams("/tmp/camera_params");
         try {
             parseYawCalibration(loadFile("yaw_calibration.yaml")["yaw_calibration"]);
         } catch (const std::exception& e) {
@@ -128,8 +133,81 @@ void missionConfig::parseCamera(const YAML::Node& node) {
     data_.camera.offsetDown    = node["offsetDown"]    ? node["offsetDown"].as<double>()    : 0.0;
 }
 
+void missionConfig::parseMount(const YAML::Node& node) {
+    data_.mount.leftForward  = node["leftForward"]  ? node["leftForward"].as<double>()  : 0.0;
+    data_.mount.leftRight    = node["leftRight"]    ? node["leftRight"].as<double>()    : -0.075;
+    data_.mount.rightForward = node["rightForward"] ? node["rightForward"].as<double>() : 0.0;
+    data_.mount.rightRight   = node["rightRight"]   ? node["rightRight"].as<double>()   : 0.075;
+}
+
 void missionConfig::parseYawCalibration(const YAML::Node& node) {
     data_.yawCalibration.referenceHeading = node["reference_heading"] ? node["reference_heading"].as<double>() : 0.0;
+}
+
+// ── 读取 detector_unified.py 导出的结构化参数 (key=value 每行一条) ──
+// 若文件缺失 (启动竞态), 最多等待 ~5s; 文件过旧 (>1h) 视为残留, 忽略并回退 camera.yaml.
+void missionConfig::applyRuntimeCameraParams(const std::string& path) {
+    std::ifstream f(path);
+    for (int i = 0; i < 25 && !f.is_open(); ++i) {   // 25 × 200ms = 5s
+        std::this_thread::sleep_for(milliseconds(200));
+        f.open(path);
+    }
+    if (!f.is_open()) {
+        log("Runtime camera params not found (" + path + "), using config/camera.yaml");
+        return;
+    }
+
+    std::map<std::string, double> kv;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        // trim 空白/回车
+        auto trim = [](std::string& s) {
+            size_t b = s.find_first_not_of(" \t\r\n");
+            size_t e = s.find_last_not_of(" \t\r\n");
+            s = (b == std::string::npos) ? "" : s.substr(b, e - b + 1);
+        };
+        trim(k); trim(v);
+        if (k.empty() || v.empty()) continue;
+        try { kv[k] = std::stod(v); } catch (...) {}
+    }
+
+    // 新鲜度检查: 防止读到上一次运行遗留的参数
+    auto itTs = kv.find("timestamp");
+    if (itTs != kv.end()) {
+        double now = duration<double>(system_clock::now().time_since_epoch()).count();
+        double age = now - itTs->second;
+        if (age < 0.0 || age > 3600.0) {
+            log("Runtime camera params stale (age=" + std::to_string((int)age) +
+                "s), ignored, using config/camera.yaml");
+            return;
+        }
+    }
+
+    auto get = [&](const char* k, double& dst) {
+        auto it = kv.find(k);
+        if (it != kv.end()) dst = it->second;
+    };
+    get("fx", data_.camera.fx);
+    get("fy", data_.camera.fy);
+    get("cx", data_.camera.cx);
+    get("cy", data_.camera.cy);
+    get("offsetForward", data_.camera.offsetForward);
+    get("offsetRight",   data_.camera.offsetRight);
+    get("offsetDown",    data_.camera.offsetDown);
+    get("leftForward",   data_.mount.leftForward);
+    get("leftRight",     data_.mount.leftRight);
+    get("rightForward",  data_.mount.rightForward);
+    get("rightRight",    data_.mount.rightRight);
+
+    log("Runtime camera params applied from " + path +
+        ": fx=" + std::to_string(data_.camera.fx) +
+        " fy=" + std::to_string(data_.camera.fy) +
+        " cx=" + std::to_string(data_.camera.cx) +
+        " cy=" + std::to_string(data_.camera.cy));
 }
 
 

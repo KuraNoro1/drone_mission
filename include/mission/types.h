@@ -92,6 +92,13 @@ struct cameraConfig {
     double offsetDown;
 };
 
+struct mountConfig {
+    double leftForward;
+    double leftRight;
+    double rightForward;
+    double rightRight;
+};
+
 struct yawCalibrationConfig {
     double referenceHeading;
 };
@@ -130,6 +137,7 @@ struct missionConfigData {
     servoConfig servo;
     landingConfig landing;
     cameraConfig camera;
+    mountConfig mount;
     yawCalibrationConfig yawCalibration;
     int missionPriority;
 };

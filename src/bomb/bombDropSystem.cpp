@@ -29,6 +29,12 @@ namespace {
     // 取 10m 留足姿态/漂移/多桶间距余量, 又能拒绝中量级错位坐标。
     constexpr double kMaxTargetDistM = 10.0;
 
+    // Kalman 预测补帧的最长可信时间 (s): 超过则视为真丢失, 不再用预测像素
+    constexpr double kMaxPredictLostSec = 0.6;
+
+    // 投弹判定解耦后的保持时长 (s)
+    constexpr double kPixHoldSec = 0.20;   // 对准需保持
+
     // 视觉目标像素匹配: 优先匹配锁定桶 ID, 未找到时回退到离图像中心最近
     static bool pickTargetPixel(const multiBucketData& vis, int lockedId,
                                 double cx, double cy, double maxMatchPx,
@@ -71,7 +77,8 @@ void BombDropSystem::reset() {
     phase_ = Phase::SCAN; dropCount_ = 0; droppedSides_.clear();
     targetMap_.clear(); currentTargetIdx_ = -1;
     scanOriginN_ = 0; scanOriginE_ = 0;
-    rescanCount_ = 0; lastHasPix_ = false; 
+    rescanCount_ = 0; lastHasPix_ = false;
+    releasing_ = false;
 }
 
 DroneState BombDropSystem::getDroneState() const {
@@ -84,6 +91,69 @@ DroneState BombDropSystem::getDroneState() const {
 
 double BombDropSystem::correctedYawDeg() const {
     return static_cast<double>(link_.headingDeg()) - yawBias_;
+}
+
+// ── 当前投弹挂载点 (第1枚左, 第2枚右; 与 releasePayload 保持一致) ──
+std::string BombDropSystem::currentDropSide() const {
+    return (dropCount_ == 0) ? "Left" : "Right";
+}
+
+// ── 挂载点像素投影 ──
+// 坐标约定: 图像右=机体右, 图像下=机体后.
+// 挂载点相对相机的偏移 (mount - camera) 投影到图像:
+//   u = cx + fx * relRight / alt
+//   v = cy - fy * relFwd   / alt
+// 使桶的检测像素收敛到该点, 即等价于让挂载点位于桶正上方.
+void BombDropSystem::mountPixel(const std::string& side, double altitude,
+                                double& u, double& v) const {
+    if (altitude < 0.1) altitude = 0.1;
+
+    double mountFwd, mountRight;
+    if (side == "Left") {
+        mountFwd   = cfg_.mount.leftForward;
+        mountRight = cfg_.mount.leftRight;
+    } else {
+        mountFwd   = cfg_.mount.rightForward;
+        mountRight = cfg_.mount.rightRight;
+    }
+
+    const double relFwd   = mountFwd   - extrinsics_.offsetForward;
+    const double relRight = mountRight - extrinsics_.offsetRight;
+
+    u = intrinsics_.cx + intrinsics_.fx * relRight / altitude;
+    v = intrinsics_.cy - intrinsics_.fy * relFwd   / altitude;
+}
+
+// ── 目标像素解算: 原始检测优先, 丢帧用 Kalman 预测补帧 ──
+bool BombDropSystem::resolveTargetPixel(const multiBucketData& vis, const DroneState& ds,
+                                        double cx, double cy, double maxMatchPx,
+                                        double& pixCx, double& pixCy, bool& predicted) const {
+    predicted = false;
+
+    // 1. 本帧原始检测优先
+    if (!vis.empty() &&
+        pickTargetPixel(vis, tracker_->getLockedId(), cx, cy, maxMatchPx, pixCx, pixCy)) {
+        return true;
+    }
+
+    // 2. 原始检测缺失: 用 tracker 的 Kalman 世界坐标反投影为预测像素
+    //    仅信任短暂丢失 (≤ kMaxPredictLostSec) 且世界坐标有效的情况
+    if (!tracker_->isValid()) return false;
+    if (tracker_->lostDuration() > kMaxPredictLostSec) return false;
+
+    WorldTarget wt = tracker_->getWorldTarget();
+    if (!worldTargetValid(wt)) return false;
+
+    const double yawRad   = ds.yawDeg   * M_PI / 180.0;
+    const double rollRad  = ds.rollDeg  * M_PI / 180.0;
+    const double pitchRad = ds.pitchDeg * M_PI / 180.0;
+    double u = 0, v = 0;
+    if (!worldToPixel(wt.north, wt.east, intrinsics_, extrinsics_,
+                      ds.alt, rollRad, pitchRad, yawRad, ds.north, ds.east, u, v)) {
+        return false;
+    }
+    pixCx = u; pixCy = v; predicted = true;
+    return true;
 }
 
 // ── 辅助：飞往任意扫描点 (位置模式) ──
@@ -185,9 +255,13 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
 
     BombDropResult result{0, false};
 
-    while (dropCount_ < 2) {
+    // 第2枚投放后 dropCount_ 即达 2, 但释放脉冲可能仍在进行:
+    // 以 releasing_ 延长循环, 保证 CLIMB 继续下发 setpoint 且 serviceRelease 能恢复 holdPwm
+    while (dropCount_ < 2 || releasing_) {
+        serviceRelease();
+
         double elapsed = duration<double>(steady_clock::now() - loopStart_).count();
-        if (elapsed > totalTimeout) {
+        if (elapsed > totalTimeout && !releasing_) {
             log("Global timeout, deferring to forceDropAll");
             result.timedOut = true;
             break;
@@ -284,9 +358,20 @@ BombDropResult BombDropSystem::execute(double totalTimeout, float initYaw) {
                 if (!climbToSearchAlt()) log("CLIMB timeout");
                 phase_ = (dropCount_ >= 2) ? Phase::DONE : Phase::SELECT;
                 break;
-            case Phase::DONE: break;
+            case Phase::DONE:
+                // 若第2枚投放后 CLIMB 很快结束, 可能仍处于释放脉冲中: 低速空转等待脉冲结束
+                if (releasing_) sleep_for(milliseconds(50));
+                break;
         }
     }
+
+    // 兜底: 异常退出 (如失联) 时确保舵机回到 hold, 不长时间停在 releasePwm
+    if (releasing_) {
+        servo_.setPwm(releaseChannel_, cfg_.holdPwm);
+        releasing_ = false;
+        log("releasePayload: force hold at execute exit");
+    }
+
     result.dropsCompleted = dropCount_;
     return result;
 }
@@ -555,9 +640,10 @@ bool BombDropSystem::gotoWorldTarget() {
 
 bool BombDropSystem::centerAboveTarget() {
     const auto& target = targetMap_[currentTargetIdx_];
-    log("CENTER: centering above 桶" + std::string(bucketLabel(target.bucketId)) +
-        " at " + std::to_string(cfg_.approachAlt) + "m  world(" +
-        std::to_string(target.world.north).substr(0,4) + "," +
+    const std::string side = currentDropSide();
+    log("CENTER: centering 桶" + std::string(bucketLabel(target.bucketId)) +
+        " under " + side + " mount at " + std::to_string(cfg_.approachAlt) +
+        "m  world(" + std::to_string(target.world.north).substr(0,4) + "," +
         std::to_string(target.world.east).substr(0,4) + ")");
 
     tracker_->lockTarget(target.bucketId, target.world);
@@ -605,15 +691,16 @@ bool BombDropSystem::centerAboveTarget() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 目标匹配: 优先锁定桶ID, 未找到时取画面中心最近检测 ──
-        bool hasPix = false;
+        // ── 目标匹配: 原始检测优先, 丢帧用 Kalman 预测补帧 ──
+        bool hasPix = false, predicted = false;
         double pixCx = 0, pixCy = 0;
-        if (!vis.empty()) {
-            hasPix = pickTargetPixel(vis, tracker_->getLockedId(),
-                                     cx, cy, MAX_MATCH_PX, pixCx, pixCy);
-        }
+        hasPix = resolveTargetPixel(vis, ds, cx, cy, MAX_MATCH_PX, pixCx, pixCy, predicted);
 
         // ── 水平控制: 共享像素伺服 (含时间衰减置信度; 丢失时原地悬停) ──
+        // 目标为当前挂载点的投影像素 (随高度变化), 使挂载点而非相机中心对准桶
+        double tgtU, tgtV;
+        mountPixel(side, ds.alt, tgtU, tgtV);
+        pixelServo_.setTarget(tgtU, tgtV);
         double vx = 0, vy = 0, pixelErr = 1e9, confidence = 0.0;
         pixelServo_.step(hasPix, pixCx, pixCy, ds.alt, correctedYawDeg(),
                     0.05, 1.0, vx, vy, pixelErr, confidence);
@@ -649,10 +736,10 @@ bool BombDropSystem::centerAboveTarget() {
 
         static int cnt = 0;
         if (++cnt % 10 == 1) {
-            double logPixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : -1;
             std::snprintf(buf, sizeof(buf),
-                "[CENTER] alt=%.1f pixErr=%.0f v=(%.2f,%.2f) lost=%.1fs conf=%.2f",
-                ds.alt, logPixErr, vx, vy, sincePix, confidence);
+                "[CENTER] alt=%.1f tgt=(%.0f,%.0f) %s v=(%.2f,%.2f) lost=%.1fs conf=%.2f",
+                ds.alt, tgtU, tgtV, predicted ? "PRED" : (hasPix ? "RAW" : "LOST"),
+                vx, vy, sincePix, confidence);
             log(buf);
         }
         sleep_for(milliseconds(50));
@@ -663,9 +750,11 @@ bool BombDropSystem::centerAboveTarget() {
 
 bool BombDropSystem::descendAndDrop() {
     const auto& target = targetMap_[currentTargetIdx_];
+    const std::string side = currentDropSide();
     log("DESCEND: 桶" + std::string(bucketLabel(target.bucketId)) +
         " from " + std::to_string(cfg_.approachAlt) + "m to " +
-        std::to_string(cfg_.dropAlt) + "m  (PID continuous from CENTER)");
+        std::to_string(cfg_.dropAlt) + "m under " + side +
+        " mount  (PID continuous from CENTER)");
 
     double cx = intrinsics_.cx, cy = intrinsics_.cy;
     auto t0 = steady_clock::now();
@@ -684,10 +773,11 @@ bool BombDropSystem::descendAndDrop() {
     int  alignIdx = 0, alignCnt = 0, alignFrameCnt = 0;
 
     const double DROP_TOL_PX = 40.0;
-    const int    DROP_WIN = 10;          // 0.5s @ 50ms, 投弹略严格
-    const int    DROP_MIN = 3;           // 10 帧中 ≥3 帧, 容忍间歇检测
-    int  dropHist[10] = {0};
-    int  dropIdx = 0, dropCnt = 0, dropFrameCnt = 0;
+    // 解耦判定: 对准(pixel) 与 到位(alt+vel) 各自独立计时, 不要求同一帧同时成立
+    // 两者各自保持满阈值即投放; 到位时长取 cfg_.stableDuration (0.5s)
+    const double DT = 0.05;              // = 循环周期
+    const double STATIONARY_HOLD = cfg_.stableDuration;
+    double pixHold = 0.0, stationHold = 0.0;
 
     char buf[256];
 
@@ -702,15 +792,16 @@ bool BombDropSystem::descendAndDrop() {
         bucketPipe_.readLatest(vis);
         tracker_->update(vis, ds, intrinsics_, extrinsics_);
 
-        // ── 目标匹配: 优先锁定桶ID, 未找到时取画面中心最近检测 ──
-        bool hasPix = false;
+        // ── 目标匹配: 原始检测优先, 丢帧用 Kalman 预测补帧 ──
+        bool hasPix = false, predicted = false;
         double pixCx = 0, pixCy = 0;
-        if (!vis.empty()) {
-            hasPix = pickTargetPixel(vis, tracker_->getLockedId(),
-                                     cx, cy, MAX_MATCH_PX, pixCx, pixCy);
-        }
+        hasPix = resolveTargetPixel(vis, ds, cx, cy, MAX_MATCH_PX, pixCx, pixCy, predicted);
 
         // ── 水平控制: 共享像素伺服 (PID 从 CENTER 连续, 限半速) ──
+        // 目标随高度更新为挂载点投影像素, 保证整个下降过程挂载点始终对准桶
+        double tgtU, tgtV;
+        mountPixel(side, ds.alt, tgtU, tgtV);
+        pixelServo_.setTarget(tgtU, tgtV);
         double vx = 0, vy = 0, pixelErr = 1e9, confidence = 0.0;
         pixelServo_.step(hasPix, pixCx, pixCy, ds.alt, correctedYawDeg(),
                     0.05, 0.5, vx, vy, pixelErr, confidence);
@@ -762,28 +853,24 @@ bool BombDropSystem::descendAndDrop() {
         if (reachedDropAlt) {
             double velMag = std::hypot(ds.vx, ds.vy);
             bool pixOk = hasPix && pixelErr < DROP_TOL_PX;
-            bool velOk = velMag < cfg_.velZeroTol;
-            bool altOk = std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
-            bool dropOk = pixOk && velOk && altOk;
+            bool stationaryOk = velMag < cfg_.velZeroTol &&
+                                std::abs(alt - cfg_.dropAlt) < cfg_.altTolerance;
 
-            dropFrameCnt++;
-            dropCnt -= dropHist[dropIdx];
-            dropHist[dropIdx] = dropOk ? 1 : 0;
-            dropCnt += dropHist[dropIdx];
-            dropIdx = (dropIdx + 1) % DROP_WIN;
+            // 解耦: 对准与到位各自独立累计/清零, 不要求同一帧同时成立
+            pixHold     = pixOk        ? pixHold     + DT : 0.0;
+            stationHold = stationaryOk ? stationHold + DT : 0.0;
 
-            if (dropFrameCnt >= DROP_WIN && dropCnt >= DROP_MIN) {
-                std::string side = (dropCount_ == 0) ? "Left" :
-                    ((droppedSides_[0] == "Left") ? "Right" : "Left");
+            if (pixHold >= kPixHoldSec && stationHold >= STATIONARY_HOLD) {
                 double g = 9.81;
                 double tFall = std::sqrt(2.0 * alt / g);
                 double impN = ds.vx * tFall, impE = ds.vy * tFall;
 
                 log(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
-                log(">>>>> DROP " + side + " (" + std::to_string(dropCount_+1) + "/2) <<<<<");
+                log(">>>>> DROP " + side + " mount (" + std::to_string(dropCount_+1) + "/2) <<<<<");
                 std::snprintf(buf, sizeof(buf),
-                    "     %d/%d ok  pixErr=%.0fpx vel=%.2fm/s alt=%.2fm",
-                    dropCnt, DROP_WIN, pixelErr, velMag, alt);
+                    "     ok  mountErr=%.0fpx vel=%.2fm/s alt=%.2fm "
+                    "(pixHold=%.2fs statHold=%.2fs) tgt=(%.0f,%.0f)",
+                    pixelErr, velMag, alt, pixHold, stationHold, tgtU, tgtV);
                 log(buf);
                 std::snprintf(buf, sizeof(buf), "     impact=(%.2f,%.2f)m", impN, impE);
                 log(buf);
@@ -795,10 +882,13 @@ bool BombDropSystem::descendAndDrop() {
 
         static int cnt = 0;
         if (++cnt % 10 == 1) {
-            double logPixErr = hasPix ? std::hypot(pixCx - cx, pixCy - cy) : -1;
+            double logPixErr = hasPix ? std::hypot(pixCx - tgtU, pixCy - tgtV) : -1;
             std::snprintf(buf, sizeof(buf),
-                "[DESCEND] alt=%.1f pixErr=%.0f v=(%.2f,%.2f,%.2f) rchd=%d algn=%d lost=%.1fs conf=%.2f",
-                alt, logPixErr, vx, vy, vz, reachedDropAlt, alignVerified, sincePix, confidence);
+                "[DESCEND] alt=%.1f tgt=(%.0f,%.0f) %s mountErr=%.0f v=(%.2f,%.2f,%.2f) "
+                "rchd=%d algn=%d pixHold=%.2fs stHold=%.2fs lost=%.1fs conf=%.2f",
+                alt, tgtU, tgtV, predicted ? "PRED" : (hasPix ? "RAW" : "LOST"),
+                logPixErr, vx, vy, vz, reachedDropAlt, alignVerified,
+                pixHold, stationHold, sincePix, confidence);
             log(buf);
         }
         sleep_for(milliseconds(50));
@@ -817,6 +907,7 @@ bool BombDropSystem::climbToSearchAlt() {
 
     auto t0 = steady_clock::now();
     while (duration<double>(steady_clock::now() - t0).count() < 10.0) {
+        serviceRelease();   // 爬升期间继续下发 setpoint, 同时按时恢复 holdPwm
         offboard_.setPositionNed(
             static_cast<float>(ned.northM), static_cast<float>(ned.eastM),
             static_cast<float>(-cfg_.searchAlt), initYaw_);
@@ -829,11 +920,25 @@ bool BombDropSystem::climbToSearchAlt() {
 // ── 释放载荷 ────────────────────────────────────────────────
 
 void BombDropSystem::releasePayload(const std::string& side) {
-    int ch = (side == "Left") ? cfg_.leftChannel : cfg_.rightChannel;
-    servo_.setPwm(ch, cfg_.releasePwm);
-    sleep_for(milliseconds(static_cast<int>(cfg_.releaseDurationMs)));
-    servo_.setPwm(ch, cfg_.holdPwm);
+    releaseChannel_ = (side == "Left") ? cfg_.leftChannel : cfg_.rightChannel;
+    servo_.setPwm(releaseChannel_, cfg_.releasePwm);
+    releaseStart_ = steady_clock::now();
+    releasing_ = true;
     droppedSides_.push_back(side);
     dropCount_++;
-    log("releasePayload: dropCount_ = " + std::to_string(dropCount_));
+    log("releasePayload(" + side + "): pulse " +
+        std::to_string(static_cast<int>(cfg_.releaseDurationMs)) +
+        "ms started (non-blocking), dropCount_ = " + std::to_string(dropCount_));
+}
+
+// 由主循环/爬升循环周期调用: 脉冲到期后恢复 holdPwm, 全程不阻塞控制回路
+void BombDropSystem::serviceRelease() {
+    if (!releasing_) return;
+    double ms = duration<double, std::milli>(steady_clock::now() - releaseStart_).count();
+    if (ms >= cfg_.releaseDurationMs) {
+        servo_.setPwm(releaseChannel_, cfg_.holdPwm);
+        releasing_ = false;
+        log("releasePayload: pulse done (" + std::to_string(static_cast<int>(ms)) +
+            "ms), hold restored");
+    }
 }

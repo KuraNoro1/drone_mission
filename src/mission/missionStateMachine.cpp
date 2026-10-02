@@ -83,6 +83,7 @@ bool missionStateMachine::init() {
         dropCfg.rightChannel    = config_.servo.rightChannel;
         dropCfg.releasePwm      = config_.servo.releasePwm;
         dropCfg.holdPwm         = config_.servo.holdPwm;
+        dropCfg.mount           = config_.mount;
         dropCfg.kpXY            = vsCfg.kp;
         dropCfg.kpZ             = vsCfg.altKp;
         dropCfg.maxVelXY        = vsCfg.maxVelXY;
@@ -305,19 +306,27 @@ void missionStateMachine::computeMountPixels(double altitude,
     double& uL, double& vL, double& uR, double& vR, double& radius) {
     const double fx = config_.camera.fx, fy = config_.camera.fy;
     const double cx = config_.camera.cx, cy = config_.camera.cy;
-    const double camDx = config_.camera.offsetForward, camDy = config_.camera.offsetRight;
-    const double mntLx = -0.07, mntLy =  0.001;
-    const double mntRx =  0.07, mntRy = -0.001;
-    const double worldR = 0.10;
     if (altitude < 0.1) altitude = 0.1;
-    double offsetL = std::hypot(mntLx - camDx, mntLy - camDy);
-    double offsetR = std::hypot(mntRx - camDx, mntRy - camDy);
-    double slantL = std::sqrt(altitude * altitude + offsetL * offsetL);
-    double slantR = std::sqrt(altitude * altitude + offsetR * offsetR);
-    uL = cx + fx * (mntLx - camDx) / altitude;
-    vL = cy + fy * (mntLy - camDy) / altitude;
-    uR = cx + fx * (mntRx - camDx) / altitude;
-    vR = cy + fy * (mntRy - camDy) / altitude;
+
+    const double camFwd   = config_.camera.offsetForward;
+    const double camRight = config_.camera.offsetRight;
+
+    const double relFwdL   = config_.mount.leftForward  - camFwd;
+    const double relRightL = config_.mount.leftRight    - camRight;
+    const double relFwdR   = config_.mount.rightForward - camFwd;
+    const double relRightR = config_.mount.rightRight   - camRight;
+
+    // 坐标约定: 图像右=机体右, 图像下=机体后
+    uL = cx + fx * relRightL / altitude;
+    vL = cy - fy * relFwdL / altitude;
+    uR = cx + fx * relRightR / altitude;
+    vR = cy - fy * relFwdR / altitude;
+
+    const double offsetL = std::hypot(relFwdL, relRightL);
+    const double offsetR = std::hypot(relFwdR, relRightR);
+    const double slantL  = std::sqrt(altitude * altitude + offsetL * offsetL);
+    const double slantR  = std::sqrt(altitude * altitude + offsetR * offsetR);
+    const double worldR  = 0.10;
     radius = worldR * fx / ((slantL + slantR) * 0.5);
 }
 

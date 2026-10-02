@@ -26,6 +26,7 @@ struct DropConfig {
     int    rightChannel;
     int    releasePwm;
     int    holdPwm;
+    mountConfig mount;      // 左右挂载点 (释放点) 机体坐标偏移
     double kpXY;
     double kpZ;
     double maxVelXY;
@@ -78,8 +79,24 @@ private:
     // ── 爬升 ──
     bool climbToSearchAlt();
 
+    // ── 释放载荷: 启动释放脉冲后立即返回 (非阻塞), 由 serviceRelease() 恢复 holdPwm ──
     void releasePayload(const std::string& side);
+    void serviceRelease();
     DroneState getDroneState() const;
+
+    // ── 当前投弹应使用的挂载点 (第1枚=左, 第2枚=右) ──
+    std::string currentDropSide() const;
+
+    // ── 挂载点像素投影 (相对相机, 随高度变化) ──
+    // 返回机体坐标系下挂载点沿相机下视方向的投影像素坐标
+    void mountPixel(const std::string& side, double altitude,
+                    double& u, double& v) const;
+
+    // ── 目标像素解算: 优先原始检测; 丢帧时用 tracker 的 Kalman 预测补帧 ──
+    // predicted=true 表示返回的是预测像素 (非本帧原始检测)
+    bool resolveTargetPixel(const multiBucketData& vis, const DroneState& ds,
+                            double cx, double cy, double maxMatchPx,
+                            double& pixCx, double& pixCy, bool& predicted) const;
 
     // ── 飞回扫描原点 ──
     bool flyToScanOrigin();
@@ -96,6 +113,10 @@ private:
 
     Phase phase_;
     int dropCount_;
+    // 非阻塞释放脉冲状态
+    bool releasing_ = false;
+    int  releaseChannel_ = 0;
+    std::chrono::steady_clock::time_point releaseStart_;
     std::vector<std::string> droppedSides_;
     float initYaw_;
     double yawBias_;        // headingDeg - initYaw_ (航向角校准偏置)

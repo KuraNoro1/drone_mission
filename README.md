@@ -246,14 +246,14 @@ gst-launch-1.0 nvarguscamerasrc ! \
 | fx/fy | 1357.0 (回退值) | 以 detector_unified 运行时有效值为准 |
 | cx | 640.0 | |
 | cy | 360.0 | |
-| 安装偏移 (base_link) | (0, 0, 0) m | detector_unified `CAM_DX=CAM_DY=0` (云台中心=相机中心) |
+| 安装偏移 (base_link) | (前 0.088, 右 0, 下 0) m | 相机在机体正中心前方 8.8cm, 同步 detector_unified `CAM_FWD=0.088` |
 
 坐标约定 (全局统一): **图像右 = 机体右, 图像下 = 机体后**。
 
 修改相机内参/偏移后需手工同步 (静态对齐):
 - `scripts/detector_unified.py` (权威)
-- `scripts/detector_real.py` 中的 `FX, FY, CX, CY, CAM_DX, CAM_DY`
-- `config/camera.yaml` 中的 `fx, fy, cx, cy, offsetForward, offsetRight, offsetDown`
+- `scripts/detector_real.py` 中的 `FX, FY, CX, CY, CAM_FWD, CAM_RIGHT`
+- `config/camera.yaml` 中的 `fx, fy, cx, cy, offsetForward, offsetRight, offsetDown` 及 `mount` 段
 - `src/bomb/coordinateMapper.cpp` 使用 `config/camera.yaml`，无需改常数
 
 ---
@@ -262,9 +262,9 @@ gst-launch-1.0 nvarguscamerasrc ! \
 
 | 参数 | 值 (m) | 来源 |
 |------|--------|------|
-| 相机 X 偏移 | 0.0 | 与 detector_unified 一致 |
-| 左挂载点 | (-0.07, 0.001) | 舵机安装 |
-| 右挂载点 | (0.07, -0.001) | 舵机安装 |
+| 相机 X 偏移 | 0.088 | 机体正中心前方 8.8cm |
+| 左挂载点 | (前 0, 右 -0.075) | 舵机安装, 机体中心左侧 7.5cm |
+| 右挂载点 | (前 0, 右 0.075) | 舵机安装, 机体中心右侧 7.5cm |
 | 桶物理半径 | 0.10 | 标准桶 |
 
 ---

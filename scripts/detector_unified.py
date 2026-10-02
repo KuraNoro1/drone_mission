@@ -134,11 +134,71 @@ H_WS_EVERY = 2
 THRESH_15_20 = 30
 THRESH_20_25 = 55
 
-# v4: 相机支架固定偏移 (世界坐标系, m)
-MNT_LX = -0.23; MNT_LY = 0.087   # 左点 (m)
-MNT_RX = -0.23; MNT_RY = -0.087  # 右点
-CAM_DX = 0.00;  CAM_DY = 0.00    # 云台中心=相机中心 (无偏移)
+# v4: 相机与投水舵机挂载点在机体坐标系中的偏移 (x=前, y=右, m)
+#     以 config/camera.yaml 为准: 相机在机体正中心前方 8.8cm, 挂载点在左右 7.5cm
+CAM_FWD, CAM_RIGHT = 0.088, 0.0          # 相机偏移 (前方 8.8cm)
+MNT_LEFT_FWD, MNT_LEFT_RIGHT = 0.0, -0.075   # 左挂载点 (左侧 7.5cm)
+MNT_RIGHT_FWD, MNT_RIGHT_RIGHT = 0.0, 0.075  # 右挂载点 (右侧 7.5cm)
 WORLD_R = 0.038                  # 真实半径 3.8cm
+
+# ── 运行时相机参数导出 (单一数据源: NPZ 内参 + config/camera.yaml 偏移) ──
+# detector 启动时写出 /tmp/camera_params, C++ 启动时读取并覆盖 config/camera.yaml,
+# 避免 NPZ 内参与 camera.yaml 手工不同步导致的建图/挂载点偏置.
+CAMERA_PARAMS_PATH = "/tmp/camera_params"
+
+
+def _read_camera_yaml_offsets():
+    """从 config/camera.yaml 读取相机/挂载点偏移 (单一来源); 失败回退脚本常量."""
+    off = {
+        "offsetForward": CAM_FWD, "offsetRight": CAM_RIGHT, "offsetDown": 0.0,
+        "leftForward":   MNT_LEFT_FWD,  "leftRight":  MNT_LEFT_RIGHT,
+        "rightForward":  MNT_RIGHT_FWD, "rightRight": MNT_RIGHT_RIGHT,
+    }
+    try:
+        import yaml  # ultralytics 依赖 pyyaml, 真机通常可用
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config", "camera.yaml")
+        with open(cfg_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        cam = cfg.get("camera", {}) or {}
+        mnt = cfg.get("mount", {}) or {}
+        for k in ("offsetForward", "offsetRight", "offsetDown"):
+            if cam.get(k) is not None:
+                off[k] = float(cam[k])
+        for k in ("leftForward", "leftRight", "rightForward", "rightRight"):
+            if mnt.get(k) is not None:
+                off[k] = float(mnt[k])
+        print("📄 已从 config/camera.yaml 读取偏移: %s" % off)
+    except Exception as e:
+        print("⚠️ 读取 config/camera.yaml 失败, 使用脚本内置偏移: %s" % e)
+    return off
+
+
+def write_camera_params():
+    """把运行时有效相机参数原子写入 /tmp/camera_params (供 C++ 读取)."""
+    off = _read_camera_yaml_offsets()
+    lines = [
+        "timestamp=%.3f" % time.time(),
+        "fx=%.6f" % CAM_FX, "fy=%.6f" % CAM_FY,
+        "cx=%.6f" % CAM_CX, "cy=%.6f" % CAM_CY,
+        "offsetForward=%.6f" % off["offsetForward"],
+        "offsetRight=%.6f"   % off["offsetRight"],
+        "offsetDown=%.6f"    % off["offsetDown"],
+        "leftForward=%.6f"   % off["leftForward"],
+        "leftRight=%.6f"     % off["leftRight"],
+        "rightForward=%.6f"  % off["rightForward"],
+        "rightRight=%.6f"    % off["rightRight"],
+    ]
+    tmp = CAMERA_PARAMS_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, CAMERA_PARAMS_PATH)   # 原子替换, C++ 不会读到半截文件
+        print("✅ 已写出运行时相机参数: %s (fx=%.1f cx=%.1f)" %
+              (CAMERA_PARAMS_PATH, CAM_FX, CAM_CX))
+    except Exception as e:
+        print("⚠️ 写出 %s 失败: %s" % (CAMERA_PARAMS_PATH, e))
 
 USE_DISPLAY = False
 
@@ -373,14 +433,19 @@ def classify_bucket_id(pixel_width, cx, cy):
 def compute_mount_pixels(altitude):
     if altitude < 0.1:
         altitude = 0.1
-    offsetL = np.sqrt((MNT_LX - CAM_DX) ** 2 + (MNT_LY - CAM_DY) ** 2)
-    offsetR = np.sqrt((MNT_RX - CAM_DX) ** 2 + (MNT_RY - CAM_DY) ** 2)
+    relFwdL = MNT_LEFT_FWD - CAM_FWD
+    relRightL = MNT_LEFT_RIGHT - CAM_RIGHT
+    relFwdR = MNT_RIGHT_FWD - CAM_FWD
+    relRightR = MNT_RIGHT_RIGHT - CAM_RIGHT
+    offsetL = np.sqrt(relFwdL ** 2 + relRightL ** 2)
+    offsetR = np.sqrt(relFwdR ** 2 + relRightR ** 2)
     slantL = np.sqrt(altitude * altitude + offsetL * offsetL)
     slantR = np.sqrt(altitude * altitude + offsetR * offsetR)
-    uL = CAM_CX + CAM_FX * (MNT_LX - CAM_DX) / altitude
-    vL = CAM_CY + CAM_FY * (MNT_LY - CAM_DY) / altitude
-    uR = CAM_CX + CAM_FX * (MNT_RX - CAM_DX) / altitude
-    vR = CAM_CY + CAM_FY * (MNT_RY - CAM_DY) / altitude
+    # 坐标约定: 图像右=机体右, 图像下=机体后
+    uL = CAM_CX + CAM_FX * relRightL / altitude
+    vL = CAM_CY - CAM_FY * relFwdL / altitude
+    uR = CAM_CX + CAM_FX * relRightR / altitude
+    vR = CAM_CY - CAM_FY * relFwdR / altitude
     r = WORLD_R * CAM_FX / ((slantL + slantR) * 0.5)
     return uL, vL, uR, vR, r
 
@@ -1340,6 +1405,8 @@ def main():
     else:
         CAM_FX, CAM_FY = CAM_FX_REAL, CAM_FY_REAL
         CAM_CX, CAM_CY = CAM_CX_REAL, CAM_CY_REAL
+        # 真机: 导出有效参数供 C++ 消费 (仿真分支不写)
+        write_camera_params()
 
     if SIM_MODE:
         print("[MODE] 仿真模式 (自动启动 gz_gst_bridge, 640x640)")

@@ -14,12 +14,21 @@ void pixelServo::configure(double kp, double ki, double kd, double maxVel,
     maxVel_ = maxVel;
     imgCx_ = imgCx;
     imgCy_ = imgCy;
+    tgtU_ = imgCx;
+    tgtV_ = imgCy;
     reset();
+}
+
+void pixelServo::setTarget(double u, double v) {
+    tgtU_ = u;
+    tgtV_ = v;
 }
 
 void pixelServo::reset() {
     if (pidFwd_) pidFwd_->reset();
     if (pidRgt_) pidRgt_->reset();
+    tgtU_ = imgCx_;
+    tgtV_ = imgCy_;
     lastSeenTime_ = steady_clock::now();
     everSeen_ = false;
 }
@@ -47,12 +56,12 @@ void pixelServo::step(bool hasPix, double pixCx, double pixCy,
 
     vx = 0.0;
     vy = 0.0;
-    pixelErr = hasPix ? std::hypot(pixCx - imgCx_, pixCy - imgCy_) : 1e9;
+    pixelErr = hasPix ? std::hypot(pixCx - tgtU_, pixCy - tgtV_) : 1e9;
 
     // ── 像素伺服 (视觉丢失时原地悬停) ──
     if (hasPix && confidence > 0.01 && pidFwd_ && pidRgt_) {
-        double errU = (pixCx - imgCx_) / imgCx_;
-        double errV = (pixCy - imgCy_) / imgCy_;
+        double errU = (pixCx - tgtU_) / imgCx_;
+        double errV = (pixCy - tgtV_) / imgCy_;
         double bodyFwd = pidFwd_->update(-errV, dt) * confidence;  // 图像下→机体后
         double bodyRgt = pidRgt_->update( errU, dt) * confidence;  // 图像右→机体右
         double yawRad = yawDeg * M_PI / 180.0;
